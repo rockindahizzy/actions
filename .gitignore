@@ -8,3 +8,4 @@ node_modules
 # docs/ is traversed rather than excluded outright.
 docs/*
 !docs/adr/
+!docs/releasing.md

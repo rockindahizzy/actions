@@ -1,0 +1,95 @@
+name: ci
+
+# Repo-invariant checks. These guard rules from ADR 0001 that are otherwise
+# only conventions — the kind that hold until someone who has not read the ADR
+# opens a PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  conventional-pr-title:
+    # Versions come from commit messages, and merges are squashed, so the PR
+    # title becomes the commit message. A malformed title means a release
+    # silently does not happen — no error, no signal.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title is a conventional commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(feat|fix|perf|docs|style|refactor|test|build|ci|chore|revert)(\([a-z0-9._-]+\))?!?: .+'
+          if ! grep -Eq "$pattern" <<<"$TITLE"; then
+            echo "::error::PR title is not a conventional commit: '$TITLE'"
+            echo "Expected e.g.  feat(aws-auth): add region input"
+            echo "               fix(setup-node-yarn): honour packageManager"
+            echo "               feat(aws-auth)!: drop the region input"
+            exit 1
+          fi
+          echo "OK: $TITLE"
+
+  repo-invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: No bare tag may share a name with an action
+        # Git cannot hold both a tag `aws-auth` and tags under `aws-auth/`, so a
+        # bare tag would make every future aws-auth/vN impossible.
+        run: |
+          set -euo pipefail
+          status=0
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            if git rev-parse -q --verify "refs/tags/${pkg}" >/dev/null; then
+              echo "::error::tag '${pkg}' collides with the action of the same name; no aws-auth/vN tag can exist alongside it"
+              status=1
+            fi
+          done < <(jq -r '.packages | keys[]' release-please-config.json)
+          exit $status
+
+      - name: Composite actions must not use ./
+        # Inside a composite action, ./ resolves against the *consumer's*
+        # checkout, not this repository. $/ is the only correct form.
+        run: |
+          set -euo pipefail
+          if git ls-files '*/action.yml' '*/action.yaml' | xargs -r grep -nE '^\s*-?\s*uses:\s*\./' ; then
+            echo "::error::composite actions must reference siblings with \$/, never ./"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: Third-party actions must be SHA-pinned
+        run: |
+          set -euo pipefail
+          status=0
+          while read -r file; do
+            # A pinned ref is 40 hex chars. $/ and ./ are local, not third-party.
+            while read -r line; do
+              ref="${line##*@}"
+              case "$line" in *'uses:'*'$/'*|*'uses:'*'./'*) continue ;; esac
+              if ! grep -Eq '^[0-9a-f]{40}$' <<<"${ref%% *}"; then
+                echo "::error file=${file}::not SHA-pinned: ${line#* }"
+                status=1
+              fi
+            done < <(grep -hoE 'uses:\s*[^ ]+@[^ ]+' "$file" || true)
+          done < <(git ls-files '*.yml' '*.yaml' | grep -E '(action\.ya?ml|\.github/workflows/)')
+          exit $status
+
+      - name: Release workflow must not reference this repository
+        # A broken action would otherwise block the release that fixes it.
+        run: |
+          set -euo pipefail
+          if grep -nE 'uses:\s*(\$/|\./|rockindahizzy/actions)' .github/workflows/release.yml; then
+            echo "::error::release.yml must not reference an action from this repository"
+            exit 1
+          fi
+          echo "OK"
