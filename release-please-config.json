@@ -9,10 +9,12 @@
   "packages": {
     "aws-auth": {
       "release-type": "simple",
+      "component": "aws-auth",
       "initial-version": "0.1.0"
     },
     "private-git-dep": {
       "release-type": "simple",
+      "component": "private-git-dep",
       "initial-version": "0.1.0"
     }
   }
