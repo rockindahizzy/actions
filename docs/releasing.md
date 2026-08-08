@@ -12,10 +12,24 @@ Add an entry to `release-please-config.json`:
 "packages": {
   "aws-auth": {
     "release-type": "simple",
+    "component": "aws-auth",
     "initial-version": "0.1.0"
   }
 }
 ```
+
+**`component` is required, despite `include-component-in-tag` being set
+globally.** With `release-type: simple` there is no package manifest to read a
+name from, so `packageName` is undefined and release-please falls back to
+`normalizeComponent(undefined)`, which returns an empty string
+(`src/strategies/base.ts`). `include-component-in-tag: true` then faithfully
+includes nothing, and the tag comes out as a bare `v0.1.0`.
+
+With two such packages the failure gets worse: both share the same empty
+component, release-please logs `Multiple paths for : aws-auth,
+private-git-dep`, collapses them, and only one release surfaces. The field is
+read per package (`extractReleaserConfig` in `src/manifest.ts`) but is absent
+from the published JSON schema, so an editor will not flag its omission.
 
 **`initial-version` is required.** Without it the first release is `1.0.0`, not
 `0.1.0` — `initialReleaseVersion()` in release-please returns `1.0.0`, and

@@ -59,6 +59,31 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Every release package declares an explicit component
+        # Without it, release-type: simple has no package manifest to take a
+        # name from, the component resolves to an empty string, and the tag
+        # comes out as a bare v0.1.0 instead of <action>/v0.1.0. Two such
+        # packages collide on the same empty component and only one releases.
+        # The field is read per package but is absent from the published JSON
+        # schema, so nothing else catches its omission.
+        run: |
+          set -euo pipefail
+          bad=$(jq -r '
+            .packages
+            | to_entries
+            | map(select((.value.component // "") != .key))
+            | .[]
+            | "package \"\(.key)\" declares component \"\(.value.component // "<missing>")\""
+          ' release-please-config.json)
+
+          if [ -n "$bad" ]; then
+            while IFS= read -r line; do
+              echo "::error file=release-please-config.json::${line} — it must equal the package key"
+            done <<< "$bad"
+            exit 1
+          fi
+          echo "OK"
+
       - name: No bare tag may share a name with an action
         # Git cannot hold both a tag `aws-auth` and tags under `aws-auth/`, so a
         # bare tag would make every future aws-auth/vN impossible.
