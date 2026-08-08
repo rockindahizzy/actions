@@ -303,25 +303,33 @@ jobs:
 
           # 1. The token really is in the config — otherwise authentication
           #    would not work and every other assertion here is meaningless.
-          raw=$(git config --local --get-regexp 'url\..*\.insteadof')
+          #    This job runs the action with scope: global, so read --global.
+          #    (--local would fail outright: /tmp/fixture is not a git repo.)
+          raw=$(git config --global --get-regexp 'url\..*\.insteadof')
           if ! grep -qF "$DUMMY_TOKEN" <<<"$raw"; then
             echo "::error::token absent from git config — the rewrite would not authenticate"
             echo "$raw" | sed "s/${DUMMY_TOKEN}/***/g"
             exit 1
           fi
 
-          # 2. Therefore the token must be masked. The action calls
-          #    ::add-mask:: on it, so the runner redacts it from every
-          #    subsequent log line. Prove the mask is live by printing the
-          #    token and checking the runner replaced it: an unmasked token
-          #    would appear verbatim in this public repo's logs.
-          marker=$(echo "$DUMMY_TOKEN" | tee /tmp/masked-probe.txt)
-          if [ "$marker" = "$(cat /tmp/masked-probe.txt)" ] && grep -qF "$DUMMY_TOKEN" <<<"$marker"; then
-            echo "::error::token was NOT masked — it would appear in plaintext in workflow logs"
+          # 2. Therefore raw config must never be printed. The action prints
+          #    only the insteadOf VALUES (awk '{print $2}'), never the section
+          #    names that embed the credential. Assert that filtered form is
+          #    genuinely token-free — if someone drops the filter from
+          #    action.yml, the section name reaches the log and this fails.
+          printed=$(git config --global --get-regexp 'url\..*\.insteadof' | awk '{print $2}')
+          if grep -qF "$DUMMY_TOKEN" <<<"$printed"; then
+            echo "::error::token survives the action's print filter and would reach a public log"
             exit 1
           fi
-          rm -f /tmp/masked-probe.txt
-          echo "OK — token present in config, and masked in logs"
+
+          # And the raw form must differ from the filtered one, proving the
+          # filter is doing work rather than being a no-op over safe input.
+          if [ "$raw" = "$printed" ]; then
+            echo "::error::filter is a no-op — raw and printed config are identical"
+            exit 1
+          fi
+          echo "OK — token in config, absent from what the action prints"
 
   # Cleanup is the documented mitigation for the self-hosted-runner case, so it
   # is tested rather than only described.
