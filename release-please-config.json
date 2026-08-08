@@ -6,5 +6,10 @@
   "tag-separator": "/",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": true,
-  "packages": {}
+  "packages": {
+    "setup-node-yarn": {
+      "release-type": "simple",
+      "initial-version": "0.1.0"
+    }
+  }
 }

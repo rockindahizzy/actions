@@ -1,0 +1,330 @@
+name: test-setup-node-yarn
+
+# Verification by execution, per ADR 0001. Every assertion below is written so
+# that it fails if the action stops doing its job — a test that cannot fail is
+# worse than none.
+#
+# This workflow uses `./setup-node-yarn`, which is correct here: a *workflow*
+# runs in this repository's checkout. The `./` prohibition applies only to
+# composite action.yml files, where it would resolve against the consumer.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  # The version the fixture's package.json declares. The whole point of the
+  # action is that this comes from the repo, so the test asserts on it.
+  EXPECTED_YARN: "4.5.3"
+  FIXTURE: setup-node-yarn/__fixtures__/basic
+
+jobs:
+  # install: true, across two Node majors. Asserts the requested Node is
+  # actually active, Corepack resolved the declared Yarn, and node_modules
+  # really exists with a resolvable dependency in it.
+  install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: setup
+        uses: ./setup-node-yarn
+        with:
+          node-version: ${{ matrix.node-version }}
+          install: "true"
+          working-directory: setup-node-yarn/__fixtures__/basic
+
+      - name: Assert the requested Node major is active
+        env:
+          WANT: ${{ matrix.node-version }}
+        run: |
+          set -euo pipefail
+          actual=$(node --version)
+          echo "node --version -> ${actual}"
+          # Anchored: v2 must not satisfy a request for v20, and v20 must not
+          # satisfy v2. A bare grep would let both through.
+          if ! grep -Eq "^v${WANT}\." <<<"$actual"; then
+            echo "::error::expected Node v${WANT}.x, got ${actual}"
+            exit 1
+          fi
+
+      - name: Assert the node-version output matches the live interpreter
+        env:
+          OUT: ${{ steps.setup.outputs.node-version }}
+        run: |
+          set -euo pipefail
+          actual=$(node --version)
+          if [ "$OUT" != "$actual" ]; then
+            echo "::error::output node-version='${OUT}' but node --version='${actual}'"
+            exit 1
+          fi
+          echo "OK: ${OUT}"
+
+      - name: Assert Corepack resolved the Yarn declared in packageManager
+        working-directory: setup-node-yarn/__fixtures__/basic
+        env:
+          OUT: ${{ steps.setup.outputs.yarn-version }}
+        run: |
+          set -euo pipefail
+          actual=$(yarn --version)
+          echo "yarn --version -> ${actual}"
+
+          # Against the literal expected version, not merely "4.x": this is the
+          # regression that matters. If the action ever pinned its own Yarn,
+          # or ignored packageManager, this is the line that catches it.
+          if [ "$actual" != "$EXPECTED_YARN" ]; then
+            echo "::error::expected Yarn ${EXPECTED_YARN} from packageManager, got ${actual}"
+            exit 1
+          fi
+          if [ "$OUT" != "$EXPECTED_YARN" ]; then
+            echo "::error::output yarn-version='${OUT}', expected ${EXPECTED_YARN}"
+            exit 1
+          fi
+
+          # And confirm the fixture really is the source of that number, so the
+          # assertion above cannot pass by coincidence.
+          declared=$(node -p "require('./package.json').packageManager")
+          if [ "$declared" != "yarn@${EXPECTED_YARN}" ]; then
+            echo "::error::fixture declares '${declared}'; EXPECTED_YARN is stale"
+            exit 1
+          fi
+
+      - name: Assert node_modules exists and is usable
+        working-directory: setup-node-yarn/__fixtures__/basic
+        run: |
+          set -euo pipefail
+          if [ ! -d node_modules ]; then
+            echo "::error::install: true did not produce node_modules"
+            exit 1
+          fi
+          # nodeLinker: node-modules means the dependency must be on disk and
+          # requireable. Proves a real install, not just an empty directory.
+          if [ ! -d node_modules/is-odd ]; then
+            echo "::error::node_modules exists but is-odd was not installed"
+            exit 1
+          fi
+          # String(...) via stdout.write, not console.log: console.log applies
+          # inspect formatting and wraps a boolean in ANSI colour codes, which
+          # survive command substitution and break an exact comparison.
+          result=$(node -e 'process.stdout.write(String(require("is-odd")(3)))')
+          if [ "$result" != "true" ]; then
+            echo "::error::is-odd(3) returned '${result}', expected true"
+            exit 1
+          fi
+          echo "OK: dependency installed and requireable"
+
+      - name: Assert the resolved cache directory was populated
+        working-directory: setup-node-yarn/__fixtures__/basic
+        run: |
+          set -euo pipefail
+          # The fixture sets enableGlobalCache: false, so the cache is project
+          # local. If the action had hardcoded a path or read config wrongly,
+          # this directory would be missing or empty.
+          dir=$(yarn config get cacheFolder --json | tr -d '"')
+          echo "cacheFolder -> ${dir}"
+          if [ ! -d "$dir" ]; then
+            echo "::error::resolved cache folder does not exist: ${dir}"
+            exit 1
+          fi
+          count=$(find "$dir" -type f -name '*.zip' | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::cache folder ${dir} holds no package archives"
+            exit 1
+          fi
+          echo "OK: ${count} archives cached"
+
+  # install: false must set up the toolchain and skip the install entirely.
+  no-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: setup
+        uses: ./setup-node-yarn
+        with:
+          node-version: "20"
+          install: "false"
+          working-directory: setup-node-yarn/__fixtures__/basic
+
+      - name: Assert no install happened
+        working-directory: setup-node-yarn/__fixtures__/basic
+        run: |
+          set -euo pipefail
+          if [ -d node_modules ]; then
+            echo "::error::install: false still created node_modules"
+            find node_modules -maxdepth 1 | head -20
+            exit 1
+          fi
+          echo "OK: node_modules absent"
+
+      - name: Assert the toolchain is still set up
+        working-directory: setup-node-yarn/__fixtures__/basic
+        run: |
+          set -euo pipefail
+          # install: false is "skip the install", not "skip everything".
+          node --version | grep -Eq '^v20\.' || {
+            echo "::error::Node 20 not active under install: false"; exit 1; }
+          actual=$(yarn --version)
+          if [ "$actual" != "$EXPECTED_YARN" ]; then
+            echo "::error::expected Yarn ${EXPECTED_YARN}, got ${actual}"
+            exit 1
+          fi
+          if [ "${{ steps.setup.outputs.yarn-version }}" != "$EXPECTED_YARN" ]; then
+            echo "::error::yarn-version output wrong under install: false"
+            exit 1
+          fi
+          echo "OK: Node and Yarn available without installing"
+
+      - name: Assert the cache was still set up
+        working-directory: setup-node-yarn/__fixtures__/basic
+        run: |
+          set -euo pipefail
+          # Documented behaviour: cache setup is independent of install, so a
+          # job that installs later still benefits.
+          dir=$(yarn config get cacheFolder --json | tr -d '"')
+          if [ ! -d "$dir" ]; then
+            echo "::error::cache folder not prepared when install: false"
+            exit 1
+          fi
+          echo "OK: cache folder ready at ${dir}"
+
+  # The failure modes are part of the interface, so they are tested too. Both
+  # steps below invert success: the action *must* fail, and the step fails if
+  # it does not.
+  error-handling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build a fixture with no packageManager field
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/no-pm
+          # A yarn.lock is required for Yarn to treat this as its own project
+          # rather than walking up and adopting an ancestor as the workspace.
+          : > /tmp/no-pm/yarn.lock
+          # Written with node rather than a heredoc: a heredoc delimiter that
+          # keeps any leading whitespace is never recognised, and the redirect
+          # silently produces an empty file instead of failing.
+          node -e '
+            require("fs").writeFileSync(
+              "/tmp/no-pm/package.json",
+              JSON.stringify({ name: "no-pm", version: "0.0.0", private: true })
+            );
+          '
+          # Fail loudly here if the fixture is not what the test assumes.
+          node -e 'JSON.parse(require("fs").readFileSync("/tmp/no-pm/package.json"))'
+          ln -s /tmp/no-pm "${GITHUB_WORKSPACE}/no-pm-fixture"
+
+      - id: missing-pm
+        continue-on-error: true
+        uses: ./setup-node-yarn
+        with:
+          node-version: "20"
+          install: "false"
+          working-directory: no-pm-fixture
+
+      - name: Assert a missing packageManager is rejected
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.missing-pm.outcome }}" != "failure" ]; then
+            echo "::error::expected failure without packageManager, got '${{ steps.missing-pm.outcome }}'"
+            exit 1
+          fi
+          echo "OK: rejected"
+
+      - id: missing-dir
+        continue-on-error: true
+        uses: ./setup-node-yarn
+        with:
+          node-version: "20"
+          working-directory: setup-node-yarn/__fixtures__/does-not-exist
+
+      - name: Assert a missing working-directory is rejected
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.missing-dir.outcome }}" != "failure" ]; then
+            echo "::error::expected failure for a missing directory, got '${{ steps.missing-dir.outcome }}'"
+            exit 1
+          fi
+          echo "OK: rejected"
+
+  # The lockfile-drift guard: --immutable must fail when package.json and
+  # yarn.lock disagree. This is the property that makes the action useful in
+  # CI, and it is verified rather than assumed.
+  immutable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Copy the fixture and add an undeclared dependency
+        run: |
+          set -euo pipefail
+          cp -r "${FIXTURE}" /tmp/drift
+          ln -s /tmp/drift "${GITHUB_WORKSPACE}/drift-fixture"
+          # package.json now wants something yarn.lock does not describe.
+          node -e '
+            const fs = require("fs");
+            const p = "/tmp/drift/package.json";
+            const j = JSON.parse(fs.readFileSync(p));
+            j.dependencies["is-number"] = "6.0.0";
+            fs.writeFileSync(p, JSON.stringify(j, null, 2));
+          '
+
+      - id: drift
+        continue-on-error: true
+        uses: ./setup-node-yarn
+        with:
+          node-version: "20"
+          install: "true"
+          working-directory: drift-fixture
+
+      - name: Assert the install failed on lockfile drift
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.drift.outcome }}" != "failure" ]; then
+            echo "::error::--immutable accepted a lockfile that does not match package.json"
+            exit 1
+          fi
+          echo "OK: drift rejected"
+
+  # Guards the checkout input, which defaults to false. Deliberately no
+  # actions/checkout step: if the input does not work, there is no repository
+  # on disk and the job fails.
+  self-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      # $/ rather than ./ — with no checkout there is no workspace to resolve
+      # ./ against. $/ resolves to this repository at the running commit, so it
+      # exercises the action as changed in the pull request.
+      - id: setup
+        uses: $/setup-node-yarn
+        with:
+          node-version: "20"
+          install: "true"
+          checkout: "true"
+          working-directory: setup-node-yarn/__fixtures__/basic
+
+      - name: "Assert checkout: true produced a working tree and an install"
+        run: |
+          set -euo pipefail
+          if [ ! -f "${FIXTURE}/package.json" ]; then
+            echo "::error::checkout: true did not check the repository out"
+            exit 1
+          fi
+          if [ ! -d "${FIXTURE}/node_modules/is-odd" ]; then
+            echo "::error::install did not run after a self-checkout"
+            exit 1
+          fi
+          if [ "${{ steps.setup.outputs.yarn-version }}" != "$EXPECTED_YARN" ]; then
+            echo "::error::unexpected Yarn after self-checkout"
+            exit 1
+          fi
+          echo "OK"

@@ -1,0 +1,193 @@
+name: Setup Node and Yarn Berry
+description: >-
+  Set up Node.js and Yarn 4 Berry via Corepack, restore the Yarn cache, and
+  optionally run an immutable install. The Yarn version comes from the calling
+  repository's packageManager field — this action never pins one.
+
+inputs:
+  node-version:
+    description: >-
+      Node.js version to install. Accepts anything actions/setup-node accepts:
+      an exact version (20.11.1), a major (20), or a range (20.x).
+    required: false
+    default: "20"
+
+  install:
+    description: >-
+      Whether to run `yarn install --immutable`. Set to "false" to set up Node,
+      Corepack and the cache without installing — useful for jobs that only
+      need the toolchain, or that install a subset of workspaces themselves.
+    required: false
+    default: "true"
+
+  working-directory:
+    description: >-
+      Directory containing package.json and yarn.lock. Relative to the
+      workspace root. Set this for a monorepo whose Yarn project is not at the
+      repository root.
+    required: false
+    default: "."
+
+  checkout:
+    description: >-
+      Whether this action should check out the repository first. Defaults to
+      "false" — the caller normally checks out, because a composite action
+      cannot check out anything other than the default repository at the
+      triggering ref. See the README for when to set this to "true".
+    required: false
+    default: "false"
+
+  cache:
+    description: >-
+      Whether to save and restore the Yarn cache. Applies whether or not
+      `install` is true, so a job that installs later still warms the cache.
+    required: false
+    default: "true"
+
+  cache-key-prefix:
+    description: >-
+      Prefix for the cache key. Change it to segment caches that would
+      otherwise collide, or to deliberately invalidate every existing entry.
+    required: false
+    default: "setup-node-yarn"
+
+outputs:
+  node-version:
+    description: The Node.js version that is active after setup, e.g. v20.19.0.
+    value: ${{ steps.versions.outputs.node-version }}
+
+  yarn-version:
+    description: >-
+      The Yarn version Corepack resolved from packageManager, e.g. 4.5.3.
+    value: ${{ steps.versions.outputs.yarn-version }}
+
+  cache-hit:
+    description: >-
+      "true" if the Yarn cache was restored from an exact key match. Empty when
+      caching is disabled.
+    value: ${{ steps.yarn-cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    # Opt-in, and off by default. A composite action can only ever check out
+    # the default repository at the triggering ref, which is wrong for
+    # pull_request_target, wrong for any workflow needing submodules, an LFS
+    # fetch or a non-default fetch-depth, and wrong when the caller has already
+    # checked out. Doing it unconditionally would be right in the simple case
+    # and silently wrong everywhere else.
+    - name: Check out the repository
+      if: inputs.checkout == 'true'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    # Corepack ships with Node but is opt-in, and it is what reads
+    # packageManager. Enabling it before setup-node would enable it on the
+    # runner's preinstalled Node, which setup-node then replaces.
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    # `corepack enable` only installs the shims. The Yarn binary itself is
+    # downloaded lazily on first use, which would otherwise happen inside the
+    # cache-path step and mix a download into a step meant to read config.
+    #
+    # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 matters: without it Corepack prompts
+    # before fetching, and on a runner there is nobody to answer, so the job
+    # hangs until it times out.
+    - name: Enable Corepack and activate the declared Yarn
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+
+        if [ ! -f package.json ]; then
+          echo "::error::no package.json in '${{ inputs.working-directory }}'"
+          echo "This action reads the Yarn version from the packageManager field."
+          echo "Check out the repository first, or set working-directory."
+          exit 1
+        fi
+
+        if ! node -e 'process.exit(require("./package.json").packageManager ? 0 : 1)'; then
+          echo "::error::package.json has no packageManager field"
+          echo "This action deliberately does not pin a Yarn version: the repository"
+          echo "declares it. Add e.g.  \"packageManager\": \"yarn@4.5.3\""
+          exit 1
+        fi
+
+        corepack enable
+        # Forces the download now, and fails here with a clear message rather
+        # than midway through a later step.
+        yarn --version
+
+    # Yarn Berry's cache location is not fixed. Yarn 4 defaults
+    # enableGlobalCache to true, putting it under ~/.yarn/berry/cache rather
+    # than the .yarn/cache many guides still assume; a repo setting
+    # enableGlobalCache: false moves it back into the project. Hardcoding
+    # either path caches the wrong directory and silently never hits.
+    # Asking Yarn is the only reliable way to know.
+    - name: Resolve the Yarn cache directory
+      id: yarn-config
+      if: inputs.cache == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+        cache_dir=$(yarn config get cacheFolder --json | tr -d '"')
+        if [ -z "$cache_dir" ] || [ "$cache_dir" = "null" ]; then
+          echo "::error::could not resolve the Yarn cache folder"
+          exit 1
+        fi
+        mkdir -p "$cache_dir"
+        echo "dir=${cache_dir}" >> "$GITHUB_OUTPUT"
+        echo "Yarn cache directory: ${cache_dir}"
+
+    # Keyed on the lockfile hash, so a dependency change gets a fresh entry.
+    # Node version and OS are in the key because the cache holds build output
+    # for packages with native components; sharing across either is unsafe.
+    # restore-keys lets a changed lockfile start from the nearest prior cache
+    # and fetch only what actually differs.
+    - name: Restore the Yarn cache
+      id: yarn-cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.yarn-config.outputs.dir }}
+        key: ${{ inputs.cache-key-prefix }}-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-node${{ inputs.node-version }}-
+
+    # --immutable fails rather than rewriting yarn.lock, which is what makes CI
+    # catch a lockfile that was not committed alongside its package.json.
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+        if [ ! -f yarn.lock ]; then
+          echo "::error::no yarn.lock in '${{ inputs.working-directory }}'"
+          echo "yarn install --immutable requires a committed lockfile."
+          exit 1
+        fi
+        yarn install --immutable
+
+    - name: Record resolved versions
+      id: versions
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+        node_version=$(node --version)
+        yarn_version=$(yarn --version)
+        echo "node-version=${node_version}" >> "$GITHUB_OUTPUT"
+        echo "yarn-version=${yarn_version}" >> "$GITHUB_OUTPUT"
+        echo "Node ${node_version}, Yarn ${yarn_version}"

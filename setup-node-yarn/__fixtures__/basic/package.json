@@ -1,0 +1,9 @@
+{
+  "name": "setup-node-yarn-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "yarn@4.5.3",
+  "dependencies": {
+    "is-odd": "3.0.1"
+  }
+}
