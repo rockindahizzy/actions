@@ -6,5 +6,10 @@
   "tag-separator": "/",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": true,
-  "packages": {}
+  "packages": {
+    "private-git-dep": {
+      "release-type": "simple",
+      "initial-version": "0.1.0"
+    }
+  }
 }

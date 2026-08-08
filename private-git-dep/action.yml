@@ -1,0 +1,247 @@
+name: private-git-dep
+description: >-
+  Configure git so package managers can resolve git dependencies that live in a
+  private repository, by rewriting GitHub remotes to token-authenticated HTTPS.
+
+inputs:
+  token:
+    description: >-
+      Token with read access to the private repositories holding the git
+      dependencies. A GitHub App installation token (from
+      actions/create-github-app-token) is preferred: it is scoped to chosen
+      repositories, expires in an hour, and rotates itself. A fine-grained PAT
+      with Contents:read on those repositories also works. Never pass a classic
+      PAT — its scopes cannot be narrowed below "all repos you can read".
+      This value is masked, but see the README on why masking is not containment.
+    required: true
+  username:
+    description: >-
+      HTTP basic-auth username paired with the token. The default suits every
+      GitHub token type (App installation tokens, fine-grained PATs, and
+      GITHUB_TOKEN all authenticate as x-access-token); it exists for GitHub
+      Enterprise Server or a proxy that expects a different username.
+    required: false
+    default: x-access-token
+  host:
+    description: >-
+      Git host to rewrite. Change only for GitHub Enterprise Server. Rewriting
+      is scoped to this host, so remotes on any other host are left untouched.
+    required: false
+    default: github.com
+  scope:
+    description: >-
+      Where the rewrite is written. "local" (default) writes to the current
+      repository's .git/config, so it cannot outlive the workspace and cannot
+      leak into another job on a self-hosted runner. Use "global" only when the
+      command that resolves dependencies runs outside this repository (for
+      example a build in a temp directory); on a self-hosted runner that leaves
+      the credential in the runner user's ~/.gitconfig until the cleanup input
+      removes it. Must be "local" or "global".
+    required: false
+    default: local
+  working-directory:
+    description: >-
+      Directory whose .git/config receives the rewrite when scope is "local".
+      Must be inside a git repository — the action fails fast if it is not,
+      rather than silently configuring nothing.
+    required: false
+    default: .
+  cleanup:
+    description: >-
+      When "true" (the default) and scope is "global", the action registers the
+      rewrite for removal and prints how to remove it. Composite actions cannot
+      define a post: step, so removal is not automatic — see the README. Has no
+      effect when scope is "local", where the workspace is the cleanup boundary.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure authenticated git rewrite
+      shell: bash
+      env:
+        # The token crosses into the step as an environment variable rather than
+        # a ${{ }} expansion inside the script. An expansion is substituted into
+        # the script text before bash sees it, so the credential would appear in
+        # the file on disk and in any shell trace. As an env var it is never part
+        # of the program text.
+        TOKEN: ${{ inputs.token }}
+        USERNAME: ${{ inputs.username }}
+        HOST: ${{ inputs.host }}
+        SCOPE: ${{ inputs.scope }}
+        WORKDIR: ${{ inputs.working-directory }}
+        CLEANUP: ${{ inputs.cleanup }}
+      run: |
+        set -euo pipefail
+
+        # Mask first, before the token can reach any other command. ::add-mask::
+        # redacts the literal string from log output for the rest of the job.
+        # This is best-effort damage limitation, not containment: it only matches
+        # the exact string, so a base64'd, URL-encoded or chunked copy passes
+        # through unredacted. The real protection is never printing it.
+        if [ -z "${TOKEN:-}" ]; then
+          echo "::error::token is empty. Pass a token with read access to the private repositories."
+          exit 1
+        fi
+        echo "::add-mask::$TOKEN"
+
+        case "$SCOPE" in
+          local|global) ;;
+          *) echo "::error::scope must be 'local' or 'global', got '$SCOPE'"; exit 1 ;;
+        esac
+
+        # A URL-unsafe character in the username or host would silently change
+        # which host the rewrite targets, so validate rather than trust.
+        if ! printf '%s' "$HOST" | grep -Eq '^[A-Za-z0-9._-]+(:[0-9]+)?$'; then
+          echo "::error::host '$HOST' is not a bare hostname (optionally host:port)"
+          exit 1
+        fi
+        if ! printf '%s' "$USERNAME" | grep -Eq '^[A-Za-z0-9._~-]+$'; then
+          echo "::error::username must be URL-safe; got an unsupported value"
+          exit 1
+        fi
+
+        # The token is interpolated into a URL, so a value containing '/', '@',
+        # ':' or whitespace would silently produce a rewrite pointing somewhere
+        # other than intended rather than failing. Every GitHub token type
+        # (ghs_, ghp_, gho_, github_pat_) is [A-Za-z0-9_], so requiring that
+        # costs nothing and turns a silent misconfiguration into an error.
+        #
+        # Deliberately no token value in the message — only its length, which is
+        # enough to diagnose a truncated or empty secret.
+        if ! printf '%s' "$TOKEN" | grep -Eq '^[A-Za-z0-9_]+$'; then
+          echo "::error::token contains characters outside [A-Za-z0-9_] (length ${#TOKEN}). GitHub tokens do not; check for a stray quote, newline, or URL-encoded value in the secret."
+          exit 1
+        fi
+
+        if [ "$SCOPE" = "local" ]; then
+          cd "$WORKDIR"
+          # Fail loudly rather than writing a local config nothing will read.
+          if ! git rev-parse --git-dir >/dev/null 2>&1; then
+            echo "::error::'$WORKDIR' is not inside a git repository. Run actions/checkout first, or set scope: global."
+            exit 1
+          fi
+          scope_flag="--local"
+        else
+          scope_flag="--global"
+        fi
+
+        auth="https://${USERNAME}:${TOKEN}@${HOST}/"
+
+        # Rewrite every form a package manager may produce for this host. The
+        # ordering matters for correctness of the *set*, not of git's matching:
+        # git picks the longest matching insteadOf prefix regardless of order.
+        #
+        # ssh:// and git@ are the load-bearing entries, and the reason this
+        # action does more than the one-liner it is often written as. npm and
+        # Yarn expand the "Owner/repo#tag" shorthand to ssh://git@host/... , not
+        # to https, so an https-only rewrite never fires for the shorthand that
+        # motivates this action.
+        # Drop any rewrite this action previously wrote for this host, whatever
+        # token it carried, before writing the new one.
+        #
+        # Removing only the current token's key is not enough. The section name
+        # embeds the token, so a rotated or refreshed token creates a *second*
+        # section rather than replacing the first — and git resolves insteadOf by
+        # longest-prefix match, so the stale section wins. The caller would keep
+        # authenticating with the expired token and see confusing 401s.
+        # Select sections by their insteadOf VALUE (the from-URL), not by the
+        # section name. Filtering the name on "@${HOST}/" would only match
+        # sections that already carry a credential, leaving a pre-existing
+        # credential-less rewrite for the same host in place — and because git
+        # resolves insteadOf by longest-prefix match, that leftover can beat the
+        # entry written below and silently send traffic unauthenticated.
+        while read -r section; do
+          [ -n "$section" ] || continue
+          git config $scope_flag --remove-section "$section" 2>/dev/null || true
+        done < <(
+          git config $scope_flag --get-regexp 'url\..*\.insteadof' 2>/dev/null \
+            | while read -r key value; do
+                case "$value" in
+                  *"://${HOST}/"|*"@${HOST}/"|*"://${HOST}"|*"@${HOST}:"*)
+                    printf '%s\n' "${key%.insteadof}" ;;
+                esac
+              done \
+            | sort -u || true
+        )
+        for from in \
+          "https://${HOST}/" \
+          "ssh://git@${HOST}/" \
+          "git+ssh://git@${HOST}/" \
+          "git://${HOST}/" \
+          "git@${HOST}:"
+        do
+          git config $scope_flag --add "url.${auth}.insteadOf" "$from"
+        done
+
+        echo "Rewrote ${HOST} remotes to authenticated HTTPS (scope: ${SCOPE})."
+
+        if [ "$SCOPE" = "global" ]; then
+          # Record the exact section for the caller's cleanup step. The section
+          # name embeds the token, so it is written to GITHUB_ENV (not printed,
+          # not an output) and re-masked on read in a later step.
+          {
+            echo "PRIVATE_GIT_DEP_SECTION<<__PGD_EOF__"
+            echo "url.${auth}"
+            echo "__PGD_EOF__"
+          } >> "$GITHUB_ENV"
+
+          if [ "$CLEANUP" = "true" ]; then
+            echo "::warning::scope 'global' wrote a credential to ~/.gitconfig. Composite actions cannot run a post: step, so this is NOT removed automatically. On a self-hosted runner it persists into later jobs — add the cleanup step from the private-git-dep README with 'if: always()'."
+          fi
+        fi
+
+    - name: Verify the rewrite resolves
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        SCOPE: ${{ inputs.scope }}
+        WORKDIR: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        [ "$SCOPE" = "local" ] && cd "$WORKDIR"
+
+        # Assert the rewrite actually applies, so a misconfiguration fails here
+        # rather than as a confusing "Permission denied (publickey)" from the
+        # package manager minutes later. This is a pure config lookup: no
+        # network, and nothing that prints the credential.
+        # Read back at the SAME scope that was written. A bare `git config`
+        # read merges system+global+local, so a completely failed local write
+        # would be masked by any pre-existing global insteadOf entry and this
+        # step would report success against configuration it did not create.
+        if [ "$SCOPE" = "local" ]; then
+          verify_flag=--local
+        else
+          verify_flag=--global
+        fi
+
+        if ! git config $verify_flag --get-regexp 'url\..*\.insteadof' >/dev/null 2>&1; then
+          echo "::error::no insteadOf rewrite is in effect at ${SCOPE} scope — the configuration did not apply"
+          exit 1
+        fi
+
+        # Assert the two protocols that actually matter are both rewritten:
+        # https, and the ssh form npm/Yarn generate from the "Owner/repo#tag"
+        # shorthand. Compare against the configured insteadOf values directly.
+        #
+        # Not `git config --get-urlmatch url <url>`: that resolves url.*.<key>
+        # settings by longest-prefix match, and returns nonzero for insteadOf
+        # rewrites even when one is correctly in place. It looks like the right
+        # tool and silently is not.
+        #
+        # Not `git remote -v` either: it does show the rewrite applied, but
+        # prints the resulting URL with the token in cleartext.
+        configured=$(git config $verify_flag --get-regexp 'url\..*\.insteadof' | awk '{print $2}')
+        for required in "https://${HOST}/" "ssh://git@${HOST}/"; do
+          if ! grep -Fxq "$required" <<<"$configured"; then
+            echo "::error::no rewrite configured for ${required} — dependency resolution would still fail"
+            exit 1
+          fi
+        done
+
+        # Print ONLY the right-hand side: the plain URL being rewritten FROM.
+        # The section name on the left embeds the token, so the awk filter here
+        # is load-bearing, not cosmetic — never print this output raw.
+        echo "Rewrites in effect for:"
+        git config --get-regexp 'url\..*\.insteadof' | awk '{print "  " $2}'
