@@ -1,12 +1,11 @@
 # actions
 
 Shared GitHub Actions and reusable workflows, used across personal repositories
-and the `ArticulateLLM`, `InfraSonic-App`, `greekfi`, `g2i-ai` and `Div-or-Die`
-organizations.
+and five organizations.
 
 **This repository is public deliberately.** GitHub does not allow private
 repositories to share actions across owners — a private repo here could not be
-consumed by any of the organizations above. Public is what makes the sharing
+consumed by the organizations that use it. Public is what makes the sharing
 work without putting a token in every consuming repository.
 
 ## Nothing sensitive lives here
