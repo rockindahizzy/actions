@@ -7,6 +7,10 @@
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": true,
   "packages": {
+    "aws-auth": {
+      "release-type": "simple",
+      "initial-version": "0.1.0"
+    },
     "private-git-dep": {
       "release-type": "simple",
       "initial-version": "0.1.0"

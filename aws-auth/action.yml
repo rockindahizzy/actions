@@ -1,0 +1,172 @@
+name: aws-auth
+description: >-
+  Assume an AWS IAM role from GitHub Actions using OIDC short-lived credentials,
+  with no long-lived access keys. Thin wrapper over
+  aws-actions/configure-aws-credentials that fails early and clearly when the
+  calling workflow is missing "permissions: id-token: write".
+
+inputs:
+  role-arn:
+    description: >-
+      ARN of the IAM role to assume, e.g. arn:aws:iam::123456789012:role/my-ci-role.
+      Supply this from a caller-side variable or secret, such as a repository
+      variable named AWS_ROLE_ARN; never hardcode an ARN into a shared workflow.
+      The role's trust policy must permit this repository's OIDC subject.
+    required: true
+  region:
+    description: >-
+      AWS region to configure for subsequent steps, e.g. us-west-2. This sets
+      AWS_REGION and AWS_DEFAULT_REGION, and is the region whose STS endpoint is
+      used for the AssumeRoleWithWebIdentity call.
+    required: true
+  role-session-name:
+    description: >-
+      Name for the assumed-role session. Appears in CloudTrail as the session
+      identifier, so the default ties a session back to the workflow run that
+      created it. Max 64 characters; longer values are truncated by this action.
+    required: false
+    default: gha-${{ github.repository_id }}-${{ github.run_id }}
+  audience:
+    description: >-
+      Audience ("aud" claim) requested for the OIDC token. Leave at the default
+      unless the role's trust policy expects a different audience — some
+      GovCloud and partition setups do.
+    required: false
+    default: sts.amazonaws.com
+  mask-aws-account-id:
+    description: >-
+      Whether to register the AWS account ID and authenticated ARN as masked
+      secrets in the log. Must be exactly "true" or "false". The account ID is
+      not a secret in the usual sense, but masking keeps it out of public build
+      logs — which matters when the calling repository is public.
+    required: false
+    default: "false"
+  role-duration-seconds:
+    description: >-
+      Lifetime of the assumed-role session, in seconds. Must not exceed the
+      role's own MaxSessionDuration, or the AssumeRole call is rejected.
+    required: false
+    default: "3600"
+
+outputs:
+  account-id:
+    description: >-
+      AWS account ID the credentials belong to. Empty when mask-aws-account-id
+      is true, because a masked value cannot be passed through a step output.
+    value: ${{ steps.creds.outputs.aws-account-id }}
+  preflight-passed:
+    description: >-
+      "true" when input validation and the OIDC permission check both passed.
+      Exists so the self-test can tell "valid inputs accepted, AWS then
+      refused" apart from "preflight wrongly rejected valid inputs". Not
+      intended for general use — if preflight fails, the action fails.
+    value: ${{ steps.preflight.outputs.passed }}
+
+runs:
+  using: composite
+  steps:
+    # Everything below runs before AWS is contacted, so a misconfigured caller
+    # gets a clear message here rather than an opaque STS error later.
+    - name: Preflight — validate inputs and OIDC permission
+      shell: bash
+      env:
+        ROLE_ARN: ${{ inputs.role-arn }}
+        REGION: ${{ inputs.region }}
+        SESSION_NAME: ${{ inputs.role-session-name }}
+        MASK: ${{ inputs.mask-aws-account-id }}
+        DURATION: ${{ inputs.role-duration-seconds }}
+      run: |
+        set -euo pipefail
+        fail=0
+        err() { echo "::error::$1"; fail=1; }
+
+        # Clear any marker from an earlier invocation in this job, so the
+        # self-test cannot read a stale "passed" from a previous step.
+        rm -f "${RUNNER_TEMP}/aws-auth-preflight-passed"
+
+        # The single most common failure. GitHub injects these two variables
+        # into the job environment only when the workflow grants
+        # "permissions: id-token: write". Without it there is no token to
+        # exchange, and configure-aws-credentials fails with a message that
+        # does not name the actual cause.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::aws-auth: no OIDC token is available to this job."
+          echo "The calling workflow must grant the id-token permission:"
+          echo ""
+          echo "    permissions:"
+          echo "      id-token: write   # required by aws-auth"
+          echo "      contents: read"
+          echo ""
+          echo "Set it on the job (preferred) or at workflow top level. Note that"
+          echo "declaring any 'permissions:' block omitting id-token also fails this"
+          echo "check, and that pull_request runs from a fork never receive a token."
+          exit 1
+        fi
+
+        # Shape check only. Whether the role exists, and whether its trust
+        # policy admits this repository, is AWS's answer to give.
+        if [ -z "${ROLE_ARN}" ]; then
+          # Never write GitHub expression syntax anywhere in this file, not even
+          # inside a comment or a quoted shell string, and not backslash-escaped.
+          # The template engine parses action.yml before bash sees it: an unknown
+          # context fails validation, and an empty expression fails too. Either
+          # way the action does not load at all.
+          err "aws-auth: role-arn is empty. Pass the ARN of the role to assume, from a repository variable such as AWS_ROLE_ARN."
+        elif ! printf '%s' "${ROLE_ARN}" | grep -Eq '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+'; then
+          err "aws-auth: role-arn is not an IAM role ARN: '${ROLE_ARN}' (expected arn:aws:iam::<12-digit-account>:role/<name>)."
+        fi
+
+        if [ -z "${REGION}" ]; then
+          err "aws-auth: region is empty. Pass an AWS region, e.g. us-west-2."
+        elif ! printf '%s' "${REGION}" | grep -Eq '^[a-z]{2}(-gov)?(-iso[a-z]?)?-[a-z]+-[0-9]$'; then
+          err "aws-auth: region does not look like an AWS region: '${REGION}' (expected e.g. us-west-2)."
+        fi
+
+        # configure-aws-credentials throws a bare TypeError on any value that is
+        # not exactly true/false. Catch it here where the message can name the input.
+        case "${MASK}" in
+          true|True|TRUE|false|False|FALSE) ;;
+          *) err "aws-auth: mask-aws-account-id must be 'true' or 'false', got '${MASK}'." ;;
+        esac
+
+        if ! printf '%s' "${DURATION}" | grep -Eq '^[0-9]+$'; then
+          err "aws-auth: role-duration-seconds must be a whole number of seconds, got '${DURATION}'."
+        elif [ "${DURATION}" -lt 900 ] || [ "${DURATION}" -gt 43200 ]; then
+          err "aws-auth: role-duration-seconds must be between 900 and 43200, got '${DURATION}'. It must also not exceed the role's MaxSessionDuration."
+        fi
+
+        [ "$fail" -eq 0 ] || exit 1
+
+        # STS caps session names at 64 characters and rejects longer ones. The
+        # default is well inside that, but a caller-supplied name may not be.
+        if [ "${#SESSION_NAME}" -gt 64 ]; then
+          echo "::warning::aws-auth: role-session-name is ${#SESSION_NAME} characters; truncating to 64 for STS."
+          SESSION_NAME="${SESSION_NAME:0:64}"
+        fi
+        echo "session-name=${SESSION_NAME}" >> "$GITHUB_OUTPUT"
+
+        # A machine-checkable marker that preflight accepted the inputs, used
+        # to distinguish "valid input accepted, AWS then refused" from
+        # "preflight rejected valid input".
+        #
+        # Written to BOTH the step output and a file. When a later step of a
+        # composite action fails, the runner aborts and never evaluates this
+        # action's top-level `outputs:` mappings — so the step output resolves
+        # to empty in exactly the case the self-test needs to inspect. The file
+        # survives the abort.
+        echo "passed=true" >> "$GITHUB_OUTPUT"
+        echo "true" > "${RUNNER_TEMP}/aws-auth-preflight-passed"
+
+        echo "aws-auth: preflight OK — assuming ${ROLE_ARN} in ${REGION}"
+      id: preflight
+
+    - name: Configure AWS credentials via OIDC
+      id: creds
+      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+        role-session-name: ${{ steps.preflight.outputs.session-name }}
+        audience: ${{ inputs.audience }}
+        mask-aws-account-id: ${{ inputs.mask-aws-account-id }}
+        role-duration-seconds: ${{ inputs.role-duration-seconds }}
