@@ -188,6 +188,94 @@ jobs:
           done < <(git ls-files '*.yml' '*.yaml' | grep -E '(action\.ya?ml|\.github/workflows/)')
           exit $status
 
+      - name: Reusable workflows and their thin components must agree
+        # ADR 0001 calls this out explicitly. A reusable workflow lives flat in
+        # .github/workflows/ because GitHub forbids subdirectories there, while
+        # release-please can only version directories — so each one carries a
+        # thin directory that exists solely to be its release component.
+        #
+        # Nothing about that arrangement is self-enforcing. A workflow added
+        # without its directory is unversionable and consumers have no tag to
+        # reference; a directory left behind after its workflow is renamed
+        # publishes tags for something that no longer exists. Both states are
+        # perfectly valid YAML and valid JSON, so no other check here sees them.
+        #
+        # A reusable workflow is identified by `on.workflow_call`, which is the
+        # actual property that makes it callable — not by a naming convention.
+        # ci.yml, release.yml and the test-*.yml self-tests are ordinary
+        # workflows, have no workflow_call trigger, and are correctly ignored.
+        run: |
+          # -e matters here: if the scan below fails, its stdout is empty, and
+          # an empty list of reusable workflows would read as "everything is
+          # fine" while actually meaning "the check did not run".
+          set -euo pipefail
+          status=0
+
+          # Reusable workflows: those declaring on.workflow_call.
+          reusable=$(
+            for f in $(git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml'); do
+              ruby -ryaml -e '
+                doc = YAML.safe_load(File.read(ARGV[0]), aliases: true)
+                # YAML parses a bare `on:` key as the boolean true, so accept
+                # either spelling rather than silently matching nothing.
+                trigger = doc["on"] || doc[true]
+                # An `if` rather than `next`: `next` is only valid inside a
+                # block, and at the top level of -e it is a compile error —
+                # which would print to stderr, leave stdout empty, and make
+                # every reusable workflow look like it had no component.
+                if trigger.is_a?(Hash) && trigger.key?("workflow_call")
+                  puts File.basename(ARGV[0]).sub(/\.ya?ml\z/, "")
+                end
+              ' "$f"
+            done | sort -u
+          )
+
+          # Release components that are NOT composite actions. A composite
+          # action owns an action.yml and versions itself directly; only the
+          # remainder are thin directories standing in for a workflow file.
+          thin=$(
+            for pkg in $(jq -r '.packages | keys[]' release-please-config.json); do
+              if [ ! -f "${pkg}/action.yml" ] && [ ! -f "${pkg}/action.yaml" ]; then
+                echo "$pkg"
+              fi
+            done | sort -u
+          )
+
+          echo "reusable workflows: $(echo "$reusable" | tr '\n' ' ')"
+          echo "thin components:    $(echo "$thin" | tr '\n' ' ')"
+
+          # A reusable workflow with no component cannot be released, so
+          # consumers have no tag to pin.
+          while read -r wf; do
+            [ -n "$wf" ] || continue
+            if ! grep -qxF "$wf" <<<"$thin"; then
+              echo "::error file=.github/workflows/${wf}.yml::reusable workflow '${wf}' has no versioned component; create ${wf}/ and register it in release-please-config.json"
+              status=1
+            fi
+          done <<< "$reusable"
+
+          # A component with no reusable workflow publishes tags for something
+          # that is not callable.
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            if ! grep -qxF "$pkg" <<<"$reusable"; then
+              echo "::error file=release-please-config.json::component '${pkg}' has no .github/workflows/${pkg}.yml declaring on.workflow_call, and no ${pkg}/action.yml either"
+              status=1
+            fi
+          done <<< "$thin"
+
+          # A thin directory with no README is scaffolding nobody can explain.
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            if [ ! -f "${pkg}/README.md" ]; then
+              echo "::error file=release-please-config.json::component '${pkg}' has no README.md explaining why the directory exists"
+              status=1
+            fi
+          done <<< "$thin"
+
+          [ "$status" -eq 0 ] && echo "OK"
+          exit $status
+
       - name: Release workflow must not reference this repository
         # A broken action would otherwise block the release that fixes it.
         run: |

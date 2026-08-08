@@ -16,6 +16,16 @@
       "release-type": "simple",
       "component": "private-git-dep",
       "initial-version": "0.1.0"
+    },
+    "terraform-plan": {
+      "release-type": "simple",
+      "component": "terraform-plan",
+      "initial-version": "0.1.0"
+    },
+    "terraform-apply": {
+      "release-type": "simple",
+      "component": "terraform-apply",
+      "initial-version": "0.1.0"
     }
   }
 }
