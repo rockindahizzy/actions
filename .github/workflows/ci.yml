@@ -6,6 +6,10 @@ name: ci
 
 on:
   pull_request:
+    # `edited` matters: without it, fixing a bad PR title produces no new run
+    # and the failing check sits there forever. Re-running does not help — a
+    # re-run replays the original event payload, title included.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -18,21 +22,35 @@ jobs:
     # silently does not happen — no error, no signal.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - name: Check PR title is a conventional commit
         env:
-          TITLE: ${{ github.event.pull_request.title }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
+          # Read the title from the API, not github.event.pull_request.title.
+          # The event payload is frozen at trigger time, so a re-run replays the
+          # old title and can never pass once it has failed.
+          title=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.title')
+
           pattern='^(feat|fix|perf|docs|style|refactor|test|build|ci|chore|revert)(\([a-z0-9._-]+\))?!?: .+'
-          if ! grep -Eq "$pattern" <<<"$TITLE"; then
-            echo "::error::PR title is not a conventional commit: '$TITLE'"
+          if ! grep -Eq "$pattern" <<<"$title"; then
+            echo "::error::PR title is not a conventional commit: '$title'"
+            echo "Merges are squashed, so this title becomes the commit message"
+            echo "release-please reads. A malformed title means no release, silently."
+            echo ""
             echo "Expected e.g.  feat(aws-auth): add region input"
             echo "               fix(setup-node-yarn): honour packageManager"
             echo "               feat(aws-auth)!: drop the region input"
+            echo "               chore: tidy the README"
             exit 1
           fi
-          echo "OK: $TITLE"
+          echo "OK: $title"
 
   repo-invariants:
     runs-on: ubuntu-latest
