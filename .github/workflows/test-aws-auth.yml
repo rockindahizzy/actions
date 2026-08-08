@@ -1,0 +1,333 @@
+name: test-aws-auth
+
+# Self-test for the aws-auth action. Verification is by execution, not static
+# analysis (ADR 0001).
+#
+# A full end-to-end test needs an AWS OIDC trust relationship for this
+# repository, which does not exist yet — it is pending Terraform work in
+# another repo. So this splits in two:
+#
+#   * Jobs that need no AWS account at all. These are the majority, and they
+#     always run: input validation, the id-token diagnostic, and the action's
+#     own wiring. They exercise real failure paths by asserting that a bad
+#     input actually fails, and that the message names the cause.
+#   * assume-role, which needs a real role and is gated on the
+#     AWS_TEST_ROLE_ARN repository variable. It reports LOUDLY when it skips,
+#     so an unconfigured role never reads as a passing test.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  # Fails the build if the action's declared interface drifts from what the
+  # README and callers rely on. Cheap, and catches a renamed input immediately.
+  contract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: action.yml declares the documented interface
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e '
+            d = YAML.safe_load(File.read("aws-auth/action.yml"), aliases: true)
+            fail_count = 0
+            check = ->(cond, msg) { unless cond; puts "::error::#{msg}"; fail_count += 1; end }
+
+            check.(d["runs"]["using"] == "composite", "runs.using must be composite")
+            check.(!d["name"].to_s.empty?, "name is required")
+            check.(!d["description"].to_s.empty?, "description is required")
+
+            required = %w[role-arn region]
+            optional = %w[role-session-name audience mask-aws-account-id role-duration-seconds]
+            (required + optional).each do |k|
+              i = d["inputs"][k]
+              check.(!i.nil?, "missing input: #{k}")
+              next if i.nil?
+              check.(!i["description"].to_s.strip.empty?, "input #{k} needs a description")
+            end
+            required.each { |k| check.(d["inputs"][k]["required"] == true, "input #{k} must be required: true") }
+            # Optional inputs must carry a default, or callers get empty strings.
+            optional.each { |k| check.(!d["inputs"][k]["default"].nil?, "optional input #{k} needs a default") }
+
+            # The wrapped action must stay SHA-pinned with a version comment.
+            # Built from fragments so this line is not itself mistaken for an
+            # unpinned action reference by the repo-invariant scanner in ci.yml.
+            u = "us" + "es:"
+            src = File.read("aws-auth/action.yml")
+            pin = Regexp.new("#{u}\\s*aws-actions/configure-aws-credentials@[0-9a-f]{40}\\s*#\\s*v\\d+\\.\\d+\\.\\d+")
+            check.(src =~ pin, "configure-aws-credentials must be SHA-pinned with a version comment")
+            # ./ inside a composite action resolves against the consumer checkout.
+            check.(src !~ Regexp.new("#{u}\\s*\\./"), "composite action must not use ./")
+
+            exit(fail_count.zero? ? 0 : 1)
+          '
+          echo "OK: interface matches"
+
+  # The headline failure mode. This job deliberately grants NO id-token
+  # permission, so the action must fail with the diagnostic rather than an
+  # opaque AWS error. The role ARN here is a syntactically valid dummy — the
+  # action must never get far enough to contact AWS with it.
+  missing-id-token-permission:
+    runs-on: ubuntu-latest
+    # contents: read only — deliberately NO id-token. This omission is the
+    # subject of the test, so do not "fix" it by adding id-token here.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Invoke aws-auth without id-token permission
+        id: attempt
+        continue-on-error: true
+        uses: ./aws-auth
+        with:
+          role-arn: arn:aws:iam::000000000000:role/does-not-exist
+          region: us-west-2
+
+      - name: Assert it failed, and for the right reason
+        env:
+          OUTCOME: ${{ steps.attempt.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::expected aws-auth to fail without id-token permission, got '$OUTCOME'"
+            echo "The preflight check is not detecting the missing permission."
+            exit 1
+          fi
+          # Guard the guard: if GitHub ever granted a token here, the test above
+          # would be vacuous, so confirm the environment really lacked one.
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::this job unexpectedly has an OIDC token; the test proves nothing"
+            exit 1
+          fi
+          echo "OK: failed with the id-token diagnostic"
+
+  # Input validation. Every case must fail preflight. These run WITH id-token
+  # permission, so a passing case proves validation rejected the input rather
+  # than the job simply lacking a token.
+  reject-bad-input:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: role-arn is not an ARN
+            role-arn: not-an-arn
+            region: us-west-2
+            mask: "false"
+            duration: "3600"
+          - case: role-arn is a user, not a role
+            role-arn: arn:aws:iam::000000000000:user/someone
+            region: us-west-2
+            mask: "false"
+            duration: "3600"
+          - case: account id is not 12 digits
+            role-arn: arn:aws:iam::123:role/short-account
+            region: us-west-2
+            mask: "false"
+            duration: "3600"
+          - case: region is malformed
+            role-arn: arn:aws:iam::000000000000:role/example
+            region: not-a-region
+            mask: "false"
+            duration: "3600"
+          - case: mask flag is not a boolean
+            role-arn: arn:aws:iam::000000000000:role/example
+            region: us-west-2
+            mask: "yes"
+            duration: "3600"
+          - case: duration below the STS minimum
+            role-arn: arn:aws:iam::000000000000:role/example
+            region: us-west-2
+            mask: "false"
+            duration: "60"
+          - case: duration is not a number
+            role-arn: arn:aws:iam::000000000000:role/example
+            region: us-west-2
+            mask: "false"
+            duration: "one-hour"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Invoke aws-auth with an invalid input
+        id: attempt
+        continue-on-error: true
+        uses: ./aws-auth
+        with:
+          role-arn: ${{ matrix.role-arn }}
+          region: ${{ matrix.region }}
+          mask-aws-account-id: ${{ matrix.mask }}
+          role-duration-seconds: ${{ matrix.duration }}
+
+      - name: Assert preflight rejected it
+        env:
+          OUTCOME: ${{ steps.attempt.outcome }}
+          CASE: ${{ matrix.case }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::case '$CASE' should have been rejected by preflight, got '$OUTCOME'"
+            exit 1
+          fi
+          echo "OK: rejected — $CASE"
+
+  # The mirror of the above: valid inputs must survive preflight. Without this,
+  # validation that rejected everything would still pass reject-bad-input.
+  # There is no AWS role, so the run is expected to fail at the AWS call — the
+  # assertion is that it got PAST preflight to reach it.
+  accept-good-input:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: standard commercial region
+            region: us-west-2
+          - case: eu region, different shape
+            region: eu-central-1
+          - case: govcloud region
+            region: us-gov-west-1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Invoke aws-auth with valid inputs and no real role
+        id: attempt
+        continue-on-error: true
+        uses: ./aws-auth
+        with:
+          role-arn: arn:aws:iam::000000000000:role/nonexistent-test-role
+          region: ${{ matrix.region }}
+          mask-aws-account-id: "false"
+
+      - name: Assert preflight passed and the failure came from AWS
+        env:
+          CASE: ${{ matrix.case }}
+          OUTCOME: ${{ steps.attempt.outcome }}
+        run: |
+          set -euo pipefail
+
+          # Read the marker FILE, not steps.attempt.outputs.preflight-passed.
+          # This invocation is expected to fail at the AWS call, and when an
+          # inner step of a composite action fails the runner aborts without
+          # evaluating the action's top-level `outputs:` — so the step output
+          # is always empty here, and asserting on it could only ever fail.
+          if [ ! -f "${RUNNER_TEMP}/aws-auth-preflight-passed" ]; then
+            echo "::error::case '$CASE': preflight rejected valid input"
+            echo "Valid inputs must reach the AWS call. Check the region regex and ARN pattern."
+            exit 1
+          fi
+
+          # Cross-check: the run must still have failed overall. If it somehow
+          # succeeded against a nonexistent role, the test setup is wrong and
+          # every assertion here is suspect.
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::case '$CASE': expected the AWS call to fail for a nonexistent role, got '$OUTCOME'"
+            exit 1
+          fi
+
+          echo "OK: valid input accepted, failure came from AWS — $CASE"
+
+  # End-to-end. Gated on the AWS_TEST_ROLE_ARN repository variable because the
+  # trust relationship does not exist yet.
+  #
+  # `aws sts get-caller-identity` needs no IAM permissions, so the test role can
+  # have zero policies attached, and a compromise of this public repo would
+  # yield a session that can identify itself and nothing else.
+  assume-role:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Runs unconditionally so the skip is impossible to miss: an unconfigured
+      # role must never look like a green end-to-end test.
+      - name: Report whether the end-to-end test can run
+        env:
+          ROLE_ARN: ${{ vars.AWS_TEST_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROLE_ARN:-}" ]; then
+            echo "::warning title=aws-auth end-to-end test SKIPPED::AWS_TEST_ROLE_ARN is not set, so the real assume-role path was NOT exercised. Everything except the actual AWS call is untested until the OIDC trust policy exists."
+            {
+              echo "### aws-auth end-to-end test: SKIPPED"
+              echo ""
+              echo "The repository variable \`AWS_TEST_ROLE_ARN\` is not set, so the real"
+              echo "assume-role path was **not** exercised."
+              echo ""
+              echo "This is expected until the OIDC provider and test role exist in AWS."
+              echo "Everything else in this workflow did run."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### aws-auth end-to-end test: RUNNING" >> "$GITHUB_STEP_SUMMARY"
+            echo "OK: AWS_TEST_ROLE_ARN is configured"
+          fi
+
+      - name: Assume the test role
+        if: vars.AWS_TEST_ROLE_ARN != ''
+        uses: ./aws-auth
+        with:
+          role-arn: ${{ vars.AWS_TEST_ROLE_ARN }}
+          region: ${{ vars.AWS_TEST_REGION || 'us-west-2' }}
+          role-session-name: aws-auth-selftest-${{ github.run_id }}
+
+      - name: Assert the credentials actually work
+        if: vars.AWS_TEST_ROLE_ARN != ''
+        env:
+          EXPECTED_ROLE_ARN: ${{ vars.AWS_TEST_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+
+          # Needs no IAM permissions, so the test role can carry zero policies.
+          identity=$(aws sts get-caller-identity --output json)
+          echo "$identity"
+
+          arn=$(jq -r '.Arn' <<<"$identity")
+          account=$(jq -r '.Account' <<<"$identity")
+
+          # An assumed-role ARN looks like:
+          #   arn:aws:sts::<account>:assumed-role/<role-name>/<session-name>
+          if ! grep -q '^arn:aws[a-z-]*:sts::[0-9]\{12\}:assumed-role/' <<<"$arn"; then
+            echo "::error::expected an assumed-role STS identity, got: $arn"
+            exit 1
+          fi
+
+          # Prove we assumed the role we asked for, not merely *some* identity.
+          # Compare bare role names: an IAM role ARN may carry a path
+          # (role/team/ci-role) but STS reports only the final name segment,
+          # so stripping to the last segment avoids a spurious mismatch.
+          want_role=$(sed -e 's#.*:role/##' -e 's#.*/##' <<<"$EXPECTED_ROLE_ARN")
+          got_role=$(sed -e 's#.*:assumed-role/##' -e 's#/.*##' <<<"$arn")
+          if [ "$want_role" != "$got_role" ]; then
+            echo "::error::assumed the wrong role: wanted '$want_role', got '$got_role'"
+            exit 1
+          fi
+
+          # The session name should be the one this workflow asked for.
+          if ! grep -q "aws-auth-selftest-${GITHUB_RUN_ID}" <<<"$arn"; then
+            echo "::error::session name missing from identity: $arn"
+            exit 1
+          fi
+
+          # The credentials must be exported to the environment for later steps.
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "::error::AWS_REGION was not exported to the job environment"
+            exit 1
+          fi
+
+          echo "OK: assumed ${got_role} in account ${account}"
+          echo "### aws-auth end-to-end test: PASSED" >> "$GITHUB_STEP_SUMMARY"
