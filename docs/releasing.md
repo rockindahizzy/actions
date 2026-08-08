@@ -82,3 +82,32 @@ first release of a new major.
 Git cannot hold both a tag `aws-auth` and tags under `aws-auth/`. Creating
 `aws-auth` would make every future `aws-auth/vN` tag impossible. CI enforces
 this.
+
+## Pinned SHAs, and why the Dependabot glob matters
+
+Every third-party action is pinned to a full SHA with a `# vX.Y.Z` comment. The
+comment is not decoration: without it neither Dependabot nor Renovate can tell
+what the hash refers to, and updates stop.
+
+Dependabot's default configuration scans `.github/workflows` and a root
+`action.yml` only. A pin *inside* a composite action would never be updated
+([dependabot-core#6704](https://github.com/dependabot/dependabot-core/issues/6704),
+open and unstarted) — which would have silently frozen the
+`aws-actions/configure-aws-credentials` pin inside `aws-auth`.
+
+The `directories: ["/", "**/*"]` glob in `.github/dependabot.yml` covers it.
+GitHub documents only the single `*` wildcard for this ecosystem and gives no
+nested example, so this was **verified empirically** rather than assumed: a
+throwaway `probe/action.yml` carrying a deliberately outdated pin was picked up
+and bumped in [#10](https://github.com/rockindahizzy/actions/pull/10). The probe
+was deleted once it had answered.
+
+Two things worth knowing from that run:
+
+- Dependabot ran on **config detection**, not on the weekly schedule. `interval:
+  weekly` governs recurring checks, not the first one.
+- Grouping collapsed three directories into a single PR, as intended.
+
+Never automerge these. A dependency update that merges itself is a direct path
+into a repository whose actions hold OIDC access to AWS — and the first real
+update was a two-major jump, exactly the kind that needs a human read.
