@@ -76,12 +76,18 @@ jobs:
 
       - name: Composite actions must only use contexts they actually have
         # GitHub parses action.yml with its template engine before any shell
-        # runs, so an expression naming a context that does not exist inside a
+        # runs. An expression naming a context that does not exist inside a
         # composite action — vars, secrets, needs, matrix, job — fails
-        # validation and the action does not load AT ALL. An empty ${‌{ }} fails
-        # the same way. Neither is visible to a YAML parser: the file is
-        # perfectly valid YAML. Backslash-escaping does not help either, since
-        # the engine runs first.
+        # validation and the action does not load AT ALL, and an empty
+        # expression fails the same way. The file stays perfectly valid YAML
+        # throughout, so nothing else here catches it. Backslash-escaping does
+        # not help: the engine runs before bash.
+        #
+        # Scan the PARSED document, not the raw text. A YAML comment is stripped
+        # before the engine sees it and is therefore harmless, while the same
+        # text inside a `run:` block scalar is content and is evaluated. A
+        # raw-text scan cannot tell those apart and reports false positives on
+        # comments that merely discuss expression syntax.
         run: |
           set -euo pipefail
           files=$(git ls-files '*/action.yml' '*/action.yaml')
@@ -93,21 +99,28 @@ jobs:
               echo "::error file=${f}::${finding}"
               status=1
             done < <(
-              ruby -e '
+              ruby -ryaml -e '
                 allowed = %w[inputs steps github runner env]
-                File.readlines(ARGV[0]).each_with_index do |line, i|
-                  line.scan(/\$\{\{(.*?)\}\}/) do |m|
-                    expr = m[0].strip
-                    if expr.empty?
-                      puts "line #{i + 1}: empty expression — the action will not load"
-                    else
-                      ctx = expr[/\A([a-zA-Z_]+)/, 1]
-                      unless allowed.include?(ctx)
-                        puts "line #{i + 1}: context \"#{ctx}\" does not exist in a composite action"
+                doc = YAML.safe_load(File.read(ARGV[0]), aliases: true)
+                walk = lambda do |node, path|
+                  case node
+                  when Hash  then node.each { |k, v| walk.call(v, "#{path}.#{k}") }
+                  when Array then node.each_with_index { |v, i| walk.call(v, "#{path}[#{i}]") }
+                  when String
+                    node.scan(/\$\{\{(.*?)\}\}/) do |m|
+                      expr = m[0].strip
+                      if expr.empty?
+                        puts "#{path}: empty expression — the action will not load"
+                      else
+                        ctx = expr[/\A([a-zA-Z_]+)/, 1]
+                        unless allowed.include?(ctx)
+                          puts "#{path}: context \"#{ctx}\" does not exist in a composite action"
+                        end
                       end
                     end
                   end
                 end
+                walk.call(doc, "")
               ' "$f"
             )
           done
