@@ -70,9 +70,57 @@ by SHA.
 ## Layout
 
 ```
-<action-name>/action.yml          composite actions
-.github/workflows/<name>.yml      reusable workflows
+aws-auth/
+  action.yml                      the action itself
+  README.md
+
+terraform-plan/
+  README.md                       no action.yml — see below
+.github/workflows/
+  terraform-plan.yml              the workflow consumers call
 ```
 
-Composite actions wrap a sequence of steps. Reusable workflows wrap a whole job,
-and are the right shape when the caller only supplies inputs.
+Composite actions wrap a sequence of steps and drop into an existing job.
+Reusable workflows wrap a whole job, bringing their own `runs-on`,
+`permissions` and `concurrency` — the right shape when a job needs privileges
+of its own, or must be split across several jobs.
+
+### Why reusable workflows have a directory with no `action.yml`
+
+Two separate constraints collide:
+
+- GitHub requires reusable workflows to live flat in `.github/workflows/`.
+  [Subdirectories are not supported](https://github.com/actions/runner/issues/2102),
+  so `terraform-plan/workflow.yml` would simply never be found.
+- release-please can only version **directories**, never single files.
+
+Per-workflow versions therefore need a directory that exists purely as the
+release component. It holds a README and, once released, the generated
+`CHANGELOG.md`. The workflow itself lives in `.github/workflows/`.
+
+This is a deliberate trade recorded in
+[ADR 0001](docs/adr/0001-per-action-semantic-versioning.md): every artifact
+versions the same way, bought with a directory that will look pointless to
+anyone who does not know why. CI fails if a component and its callable file
+drift apart, since nothing else would notice.
+
+A composite action could not do this job anyway — it cannot declare
+`permissions:` or `concurrency:`, and `terraform-plan` depends on both. Its
+fork-PR refusal works because the authorising job holds no `id-token`, which
+is a job-level boundary a composite action has no way to express.
+
+### Referencing each kind
+
+```yaml
+# composite action — a step inside your job
+- uses: rockindahizzy/actions/aws-auth@aws-auth/v0
+
+# reusable workflow — a whole job
+jobs:
+  plan:
+    uses: rockindahizzy/actions/.github/workflows/terraform-plan.yml@terraform-plan/v0
+```
+
+The workflow ref names the workflow twice, once in the path and once in the
+tag. That is awkward but unavoidable: the path locates the file and the tag
+selects the version, and per-workflow versioning needs both.
