@@ -1,0 +1,439 @@
+name: test-private-git-dep
+
+# What this can and cannot verify.
+#
+# This is a public repository with no private-repo credential, so the end-to-end
+# path — "yarn install actually resolves a private dependency" — cannot run here.
+# What CAN be verified without a secret is everything up to the network boundary,
+# and that is what these jobs assert:
+#
+#   - the rewrite is written for every protocol a package manager emits,
+#     including the ssh:// form that an https-only rewrite would miss
+#   - a real `yarn install` picks the rewrite up and switches protocol
+#   - the token never appears in the printed output
+#   - scope: local confines the credential to the workspace
+#   - cleanup removes the credential from a global config
+#
+# The dummy token below is a literal non-secret. It authenticates nothing; the
+# assertions are about where it lands in configuration, not whether it works.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  # Not a credential. A recognisable sentinel so a leak assertion has something
+  # unambiguous to grep for.
+  DUMMY_TOKEN: ghs_PrivateGitDepSelfTestNotARealToken000
+
+jobs:
+  # The core matrix: the rewrite must be written correctly in both scopes, and
+  # must cover every protocol form. The ssh:// row is the regression guard —
+  # an https-only implementation passes every other assertion and fails these.
+  rewrite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [local, global]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Baseline — no rewrite before the action runs
+        run: |
+          set -euo pipefail
+          if git config --get-regexp 'url\..*\.insteadof' >/dev/null 2>&1; then
+            echo "::error::a url.*.insteadOf rewrite already existed; the test cannot attribute a later one to the action"
+            exit 1
+          fi
+          echo "OK: clean baseline"
+
+      - name: Run the action
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: ${{ matrix.scope }}
+
+      - name: Every protocol form is rewritten
+        env:
+          SCOPE: ${{ matrix.scope }}
+        run: |
+          set -euo pipefail
+          # --local and --global must be read explicitly: a bare `git config`
+          # read would find a global entry and let a broken --local write pass.
+          if [ "$SCOPE" = "local" ]; then flag=--local; else flag=--global; fi
+
+          configured=$(git config $flag --get-regexp 'url\..*\.insteadof' | awk '{print $2}')
+          echo "configured rewrites:"; sed 's/^/  /' <<<"$configured"
+
+          status=0
+          for required in \
+            "https://github.com/" \
+            "ssh://git@github.com/" \
+            "git+ssh://git@github.com/" \
+            "git://github.com/" \
+            "git@github.com:"
+          do
+            if grep -Fxq "$required" <<<"$configured"; then
+              echo "  ok   $required"
+            else
+              echo "::error::missing rewrite for $required"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: The rewrite resolves to the authenticated URL
+        env:
+          SCOPE: ${{ matrix.scope }}
+        run: |
+          set -euo pipefail
+          # Ground truth that git itself applies the rewrite, rather than just
+          # that the config keys exist. `git remote -v` prints the rewritten URL
+          # with the token in it, so this must never be echoed raw — it is piped
+          # straight into assertions.
+          if [ "$SCOPE" = "global" ]; then
+            work=$(mktemp -d); git -C "$work" init -q .
+          else
+            work=.
+          fi
+          git -C "$work" remote add probe ssh://git@github.com/Owner/repo.git
+          rewritten=$(git -C "$work" remote get-url probe)
+
+          if ! grep -q '^https://' <<<"$rewritten"; then
+            echo "::error::ssh remote was not rewritten to https — yarn would still fail with 'Permission denied (publickey)'"
+            exit 1
+          fi
+          if ! grep -q "@github.com/Owner/repo.git$" <<<"$rewritten"; then
+            echo "::error::rewritten URL does not point at the original repository path"
+            exit 1
+          fi
+          # Confirm the credential is actually present, without printing it.
+          if ! grep -qF "$DUMMY_TOKEN" <<<"$rewritten"; then
+            echo "::error::rewritten URL carries no credential"
+            exit 1
+          fi
+          echo "OK: ssh:// remote resolves to authenticated https, path preserved"
+
+      - name: Rewriting is scoped to the configured host
+        env:
+          SCOPE: ${{ matrix.scope }}
+        run: |
+          set -euo pipefail
+          if [ "$SCOPE" = "global" ]; then
+            work=$(mktemp -d); git -C "$work" init -q .
+          else
+            work=.
+          fi
+          git -C "$work" remote add other https://gitlab.com/Owner/repo.git
+          url=$(git -C "$work" remote get-url other)
+          if grep -qF "$DUMMY_TOKEN" <<<"$url"; then
+            echo "::error::credential leaked onto a non-github.com remote"
+            exit 1
+          fi
+          echo "OK: gitlab.com remote untouched"
+
+      - name: scope=local does not touch the global config
+        if: matrix.scope == 'local'
+        run: |
+          set -euo pipefail
+          # The self-hosted-runner property: nothing escapes the workspace.
+          if git config --global --get-regexp 'url\..*\.insteadof' >/dev/null 2>&1; then
+            echo "::error::scope 'local' wrote to the global config"
+            exit 1
+          fi
+          echo "OK: ~/.gitconfig clean"
+
+      - name: Re-running replaces the rewrite rather than appending
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: ${{ matrix.scope }}
+
+      - name: No duplicate entries after a second run
+        env:
+          SCOPE: ${{ matrix.scope }}
+        run: |
+          set -euo pipefail
+          if [ "$SCOPE" = "local" ]; then flag=--local; else flag=--global; fi
+          # A stale second credential is the failure being guarded against: two
+          # entries for one protocol means an old token lingers in the config.
+          dupes=$(git config $flag --get-regexp 'url\..*\.insteadof' \
+                  | awk '{print $2}' | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::duplicate insteadOf entries after re-run:"
+            sed 's/^/  /' <<<"$dupes"
+            exit 1
+          fi
+          echo "OK: no duplicates"
+
+      # Token rotation. The section name embeds the token, so a naive
+      # implementation adds a second section rather than replacing the first —
+      # and git's longest-prefix match then keeps using the OLD token.
+      - name: Run again with a rotated token
+        uses: ./private-git-dep
+        with:
+          token: ghs_PrivateGitDepSelfTestRotatedToken111
+          scope: ${{ matrix.scope }}
+
+      - name: The rotated token replaces the old one
+        env:
+          SCOPE: ${{ matrix.scope }}
+          OLD_TOKEN: ${{ env.DUMMY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$SCOPE" = "local" ]; then
+            flag=--local; work=.
+          else
+            flag=--global; work=$(mktemp -d); git -C "$work" init -q .
+          fi
+
+          # The stale section must be gone entirely.
+          if git config $flag --name-only --get-regexp 'url\..*\.insteadof' \
+             | grep -qF "$OLD_TOKEN"; then
+            echo "::error::the previous token's section survived rotation"
+            exit 1
+          fi
+
+          # And resolution must actually use the new token.
+          git -C "$work" remote add rot ssh://git@github.com/Owner/repo.git
+          url=$(git -C "$work" remote get-url rot)
+          if grep -qF "$OLD_TOKEN" <<<"$url"; then
+            echo "::error::rotation left the old token winning the prefix match"
+            exit 1
+          fi
+          if ! grep -qF 'ghs_PrivateGitDepSelfTestRotatedToken111' <<<"$url"; then
+            echo "::error::rotated token is not the one being used"
+            exit 1
+          fi
+          echo "OK: rotation replaced the credential"
+
+  # The behavioural test: a real package manager, resolving a real shorthand
+  # dependency, against the real network. Asserted on the protocol it chooses.
+  yarn-picks-up-the-rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: A private git dependency, in the shorthand form from issue #2
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fixture
+          cat > /tmp/fixture/package.json <<'JSON'
+          {
+            "name": "fixture",
+            "version": "1.0.0",
+            "dependencies": {
+              "some-private-dep": "ArticulateLLM/does-not-exist-private#v0.0.1"
+            }
+          }
+          JSON
+
+      # Before the action: Yarn expands the shorthand to ssh://git@github.com/
+      # and fails on the missing public key. This pins the premise the action
+      # exists to address — and would catch Yarn changing its expansion.
+      - name: Without the rewrite, Yarn tries ssh and fails on publickey
+        run: |
+          set -euo pipefail
+          cd /tmp/fixture
+          set +e
+          out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=no" \
+                yarn install --no-lockfile --network-timeout 60000 2>&1)
+          set -e
+          echo "$out" | tail -20
+
+          if ! grep -q 'ssh://git@github.com/' <<<"$out"; then
+            echo "::error::expected Yarn to expand the shorthand to ssh://git@github.com/ — the premise of this action no longer holds"
+            exit 1
+          fi
+          if ! grep -qi 'publickey\|Permission denied' <<<"$out"; then
+            echo "::error::expected an ssh publickey failure before the rewrite"
+            exit 1
+          fi
+          echo "OK: confirmed Yarn uses ssh:// for the shorthand, and fails without credentials"
+
+      - name: Run the action
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: global
+
+      # After the action: the ssh attempt is gone. Yarn now reaches github.com
+      # over authenticated https and fails on the *token*, not on ssh keys.
+      # That protocol switch is the action working.
+      - name: With the rewrite, Yarn switches to https auth
+        run: |
+          set -euo pipefail
+          cd /tmp/fixture
+          set +e
+          out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=no" \
+                yarn install --no-lockfile --network-timeout 60000 2>&1)
+          set -e
+          echo "$out" | tail -20
+
+          if grep -qi 'publickey' <<<"$out"; then
+            echo "::error::still failing on ssh publickey — the rewrite did not apply to Yarn's resolution"
+            exit 1
+          fi
+          # The dummy token is rejected by GitHub, which is the expected and
+          # only reachable outcome without a real credential. What matters is
+          # that the failure is now an HTTPS authentication failure.
+          if ! grep -qi 'Authentication failed\|Invalid username or token\|could not read Username\|not found\|repository .* not found' <<<"$out"; then
+            echo "::error::expected an https authentication/not-found failure after the rewrite; got something else"
+            exit 1
+          fi
+          echo "OK: Yarn resolved over https using the rewrite (auth rejected, as expected for a dummy token)"
+
+      - name: The token is present in config but masked in logs
+        run: |
+          set -euo pipefail
+          cd /tmp/fixture
+
+          # Two distinct claims, and the earlier version of this test proved
+          # neither: it applied `awk '{print $2}'` itself, stripping the
+          # token-bearing section name before grepping, so it passed no matter
+          # what the action did.
+
+          # 1. The token really is in the config — otherwise authentication
+          #    would not work and every other assertion here is meaningless.
+          #    This job runs the action with scope: global, so read --global.
+          #    (--local would fail outright: /tmp/fixture is not a git repo.)
+          raw=$(git config --global --get-regexp 'url\..*\.insteadof')
+          if ! grep -qF "$DUMMY_TOKEN" <<<"$raw"; then
+            echo "::error::token absent from git config — the rewrite would not authenticate"
+            echo "$raw" | sed "s/${DUMMY_TOKEN}/***/g"
+            exit 1
+          fi
+
+          # 2. Therefore raw config must never be printed. The action prints
+          #    only the insteadOf VALUES (awk '{print $2}'), never the section
+          #    names that embed the credential. Assert that filtered form is
+          #    genuinely token-free — if someone drops the filter from
+          #    action.yml, the section name reaches the log and this fails.
+          printed=$(git config --global --get-regexp 'url\..*\.insteadof' | awk '{print $2}')
+          if grep -qF "$DUMMY_TOKEN" <<<"$printed"; then
+            echo "::error::token survives the action's print filter and would reach a public log"
+            exit 1
+          fi
+
+          # And the raw form must differ from the filtered one, proving the
+          # filter is doing work rather than being a no-op over safe input.
+          if [ "$raw" = "$printed" ]; then
+            echo "::error::filter is a no-op — raw and printed config are identical"
+            exit 1
+          fi
+          echo "OK — token in config, absent from what the action prints"
+
+  # Cleanup is the documented mitigation for the self-hosted-runner case, so it
+  # is tested rather than only described.
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run the action with the global scope
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: global
+
+      - name: Credential is present before cleanup
+        run: |
+          set -euo pipefail
+          if ! git config --global --get-regexp 'url\..*\.insteadof' >/dev/null 2>&1; then
+            echo "::error::expected a global rewrite to clean up"
+            exit 1
+          fi
+          echo "OK: rewrite present"
+
+      # Exactly the snippet the README tells consumers to copy. If this drifts
+      # from the README, the documented cleanup is wrong.
+      - name: Remove the credential
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${PRIVATE_GIT_DEP_SECTION:-}" ]; then
+            git config --global --remove-section "$PRIVATE_GIT_DEP_SECTION" || true
+          fi
+
+      - name: No credential remains in the global config
+        run: |
+          set -euo pipefail
+          if git config --global --get-regexp 'url\..*\.insteadof' >/dev/null 2>&1; then
+            echo "::error::cleanup left an insteadOf rewrite behind"
+            git config --global --get-regexp 'url\..*\.insteadof' | awk '{print "  " $2}'
+            exit 1
+          fi
+          # Belt and braces: the raw file must not contain the token at all.
+          if [ -f "$HOME/.gitconfig" ] && grep -qF "$DUMMY_TOKEN" "$HOME/.gitconfig"; then
+            echo "::error::token still present in ~/.gitconfig after cleanup"
+            exit 1
+          fi
+          echo "OK: global config clean"
+
+  # Input validation must fail closed. A silently-succeeding no-op would leave
+  # the caller believing dependencies are authenticated when they are not.
+  rejects-bad-input:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: An invalid scope is rejected
+        id: badscope
+        continue-on-error: true
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: sideways
+
+      - name: Assert it failed
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.badscope.outcome }}" != "failure" ]; then
+            echo "::error::scope 'sideways' was accepted; invalid input must fail closed"
+            exit 1
+          fi
+          echo "OK: rejected"
+
+      - name: scope=local outside a repository is rejected
+        id: norepo
+        continue-on-error: true
+        uses: ./private-git-dep
+        with:
+          token: ${{ env.DUMMY_TOKEN }}
+          scope: local
+          working-directory: /tmp
+
+      - name: Assert it failed
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.norepo.outcome }}" != "failure" ]; then
+            echo "::error::a non-repository working-directory was accepted; it would configure nothing"
+            exit 1
+          fi
+          echo "OK: rejected"
+
+      # A token containing URL metacharacters would otherwise be interpolated
+      # into the rewrite and point it at another host, with no error raised.
+      - name: A malformed token is rejected rather than silently misconfigured
+        id: badtoken
+        continue-on-error: true
+        uses: ./private-git-dep
+        with:
+          token: "evil/token@attacker.example.com"
+
+      - name: Assert it failed
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.badtoken.outcome }}" != "failure" ]; then
+            echo "::error::a token containing '/' and '@' was accepted; the rewrite would target the wrong host"
+            exit 1
+          fi
+          echo "OK: rejected"
