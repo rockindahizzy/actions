@@ -9,9 +9,9 @@ inputs:
   role-arn:
     description: >-
       ARN of the IAM role to assume, e.g. arn:aws:iam::123456789012:role/my-ci-role.
-      Supply this from a caller-side variable or secret (${{ vars.AWS_ROLE_ARN }});
-      never hardcode an ARN into a shared workflow. The role's trust policy must
-      permit this repository's OIDC subject.
+      Supply this from a caller-side variable or secret, such as a repository
+      variable named AWS_ROLE_ARN; never hardcode an ARN into a shared workflow.
+      The role's trust policy must permit this repository's OIDC subject.
     required: true
   region:
     description: >-
