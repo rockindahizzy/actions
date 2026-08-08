@@ -106,7 +106,10 @@ runs:
         # Shape check only. Whether the role exists, and whether its trust
         # policy admits this repository, is AWS's answer to give.
         if [ -z "${ROLE_ARN}" ]; then
-          err "aws-auth: role-arn is empty. Pass the ARN of the role to assume, e.g. \${{ vars.AWS_ROLE_ARN }}."
+          # Do not write a literal ${{ }} here, even backslash-escaped: GitHub's
+          # template engine parses this file before bash sees it, and 'vars' is
+          # not a valid context inside a composite action.
+          err "aws-auth: role-arn is empty. Pass the ARN of the role to assume, from a repository variable such as AWS_ROLE_ARN."
         elif ! printf '%s' "${ROLE_ARN}" | grep -Eq '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+'; then
           err "aws-auth: role-arn is not an IAM role ARN: '${ROLE_ARN}' (expected arn:aws:iam::<12-digit-account>:role/<name>)."
         fi
