@@ -1,0 +1,949 @@
+name: terraform-apply
+
+# Reusable workflow: apply the stored plan for one environment, triggered by
+# `/apply <name>` on the pull request.
+#
+# Atlantis model (issue #3). There is no apply-after-merge path and no other
+# apply path at all: the only way this workflow applies anything is a comment
+# from someone with write access, against a plan terraform-plan.yml stored on
+# that same PR.
+#
+# The versioned component for this file is the terraform-apply/ directory. See
+# ADR 0001, and terraform-apply/README.md for consumer usage and the ruleset
+# needed to gate merge on the apply.
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: >-
+          Environment name. Must match the `name` given to terraform-plan for
+          this environment — it is how `/apply <name>` finds the stored plan and
+          names the status check.
+        required: true
+        type: string
+      working-directory:
+        description: >-
+          Directory holding the Terraform root module. Must match the value
+          given to terraform-plan; a mismatch is rejected rather than applied.
+        required: true
+        type: string
+      aws-role-arn:
+        description: >-
+          ARN of the IAM role to assume via OIDC. Supply from a caller-side
+          variable; never hardcode an ARN.
+        required: true
+        type: string
+      aws-region:
+        description: AWS region for the apply.
+        required: false
+        default: us-west-2
+        type: string
+      terraform-init-args:
+        description: Extra arguments appended to terraform init. Word-split on whitespace.
+        required: false
+        default: ""
+        type: string
+      runs-on:
+        description: Runner label for the apply job.
+        required: false
+        default: ubuntu-latest
+        type: string
+      status-check-name:
+        description: >-
+          Name of the commit status this workflow reports. This is the string the
+          consumer puts in their ruleset to gate merge. Defaults to
+          "terraform-apply/<name>".
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: >-
+          Optional GitHub Environment for the apply job. Setting this is the
+          supported way to add a manual approval gate or scope environment
+          secrets to the apply. Empty means none.
+        required: false
+        default: ""
+        type: string
+    outputs:
+      applied:
+        description: '"true" when terraform apply completed successfully.'
+        value: ${{ jobs.apply.outputs.applied }}
+
+permissions: {}
+
+# Never apply the same environment twice at once, and never cancel an apply in
+# flight — a half-applied Terraform run is the worst possible state. This is the
+# opposite choice from terraform-plan, where cancelling a superseded plan is free.
+concurrency:
+  group: terraform-apply-${{ inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  # Authorisation and command parsing. Runs before anything is downloaded or
+  # executed, and holds no AWS permission of any kind.
+  authorize:
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # to react to and reply to the command comment
+    outputs:
+      should-run: ${{ steps.decide.outputs.should-run }}
+      pr-number: ${{ steps.decide.outputs.pr-number }}
+      head-sha: ${{ steps.decide.outputs.head-sha }}
+      actor: ${{ steps.decide.outputs.actor }}
+      status-check: ${{ steps.decide.outputs.status-check }}
+      comment-id: ${{ steps.decide.outputs.comment-id }}
+    steps:
+      - name: Parse the command and authorise the commenter
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENV_NAME: ${{ inputs.name }}
+          STATUS_NAME_INPUT: ${{ inputs.status-check-name }}
+          # Untrusted: an arbitrary internet user wrote this. Passed through the
+          # environment so it is never interpolated into the script body.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          echo "should-run=false" >> "$GITHUB_OUTPUT"
+
+          status_check="${STATUS_NAME_INPUT}"
+          if [ -z "$status_check" ]; then
+            status_check="terraform-apply/${ENV_NAME}"
+          fi
+          echo "status-check=${status_check}" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_PR_COMMENT" != "true" ]; then
+            echo "comment is on an issue, not a pull request"
+            exit 0
+          fi
+
+          # Only the first non-blank line counts, so quoting someone else's
+          # "/apply production" in a reply cannot trigger an apply.
+          first_line=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n1 || true)
+          command=$(printf '%s' "$first_line" | awk '{$1=$1; print}')
+
+          verb=$(printf '%s' "$command" | awk '{print $1}')
+          target=$(printf '%s' "$command" | awk '{print $2}')
+          extra=$(printf '%s' "$command" | awk '{print $3}')
+
+          if [ "$verb" != "/apply" ]; then
+            echo "not an /apply command"
+            exit 0
+          fi
+
+          if [ -n "$extra" ]; then
+            echo "::warning::ignoring malformed command: expected '/apply <environment>'"
+            exit 0
+          fi
+
+          if [ -z "$target" ]; then
+            echo "::warning::'/apply' needs an environment name, e.g. '/apply ${ENV_NAME}'"
+            exit 0
+          fi
+
+          # Every caller job sees every comment; only the job owning this
+          # environment proceeds. Applying every environment on a bare /apply
+          # would be the single most dangerous possible default.
+          if [ "$target" != "$ENV_NAME" ]; then
+            echo "command targets '${target}', this job is '${ENV_NAME}' — nothing to do"
+            exit 0
+          fi
+
+          # ---------------------------------------------------------------
+          # AUTHORISATION. This is the check that stands between an anonymous
+          # comment on a public repository and a real terraform apply against
+          # real infrastructure.
+          #
+          # The collaborator permission endpoint is the authority. Do NOT
+          # substitute author_association from the comment payload: it reports
+          # OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR/NONE, and CONTRIBUTOR means
+          # only "has had a PR merged", not "has write access".
+          # ---------------------------------------------------------------
+          permission=$(gh api "repos/${REPO}/collaborators/${COMMENT_AUTHOR}/permission" \
+                         --jq '.permission' 2>/dev/null || echo "none")
+
+          case "$permission" in
+            admin|write) ;;
+            *)
+              echo "::error::${COMMENT_AUTHOR} has '${permission}' permission; /apply requires write or admin"
+              gh api --method POST \
+                "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='-1' >/dev/null || true
+              gh api --method POST \
+                "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="@${COMMENT_AUTHOR} \`/apply\` requires **write** or **admin** permission on this repository; your permission level is \`${permission}\`. **Nothing was applied.**" \
+                >/dev/null || true
+              exit 1
+              ;;
+          esac
+
+          pr_json=$(gh api "repos/${REPO}/pulls/${ISSUE_NUMBER}")
+          head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          pr_state=$(jq -r '.state' <<<"$pr_json")
+          merged=$(jq -r '.merged' <<<"$pr_json")
+
+          # An apply is a pre-merge action by design. Once the PR is merged or
+          # closed the plan on it is history, and applying it would be exactly
+          # the apply-after-merge path this design exists to remove.
+          if [ "$pr_state" != "open" ] || [ "$merged" = "true" ]; then
+            echo "::error::pull request #${ISSUE_NUMBER} is ${pr_state} (merged=${merged}); apply happens on an OPEN pull request only"
+            # Built in a file rather than inline: a multi-line shell string
+            # would have to start at column 0 to avoid leading spaces, which
+            # ends the enclosing YAML block scalar early.
+            refused="$(mktemp)"
+            {
+              printf '### Terraform apply refused — `%s`\n\n' "${ENV_NAME}"
+              printf 'This pull request is `%s` (merged: `%s`). Apply runs on an **open** ' "${pr_state}" "${merged}"
+              printf 'pull request only; there is deliberately no apply-after-merge path. '
+              printf '**Nothing was applied.**\n'
+            } > "$refused"
+            gh api --method POST \
+              "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+              -F body=@"$refused" >/dev/null || true
+            exit 1
+          fi
+
+          # 'eyes', not 'rocket'. This point means "command accepted and the
+          # commenter is authorised" — every apply-side gate is still ahead
+          # (plan exists, provenance verified, commit current, destroy guard),
+          # and refusals there are common. A rocket here would read as "apply
+          # started" on runs where nothing is ever applied. The rocket is posted
+          # by the apply job once those gates have passed.
+          gh api --method POST \
+            "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='eyes' >/dev/null || true
+
+          {
+            echo "should-run=true"
+            echo "pr-number=${ISSUE_NUMBER}"
+            echo "head-sha=${head_sha}"
+            echo "actor=${COMMENT_AUTHOR}"
+            echo "comment-id=${COMMENT_ID}"
+          } >> "$GITHUB_OUTPUT"
+          echo "authorised /apply for '${ENV_NAME}' at ${head_sha} by ${COMMENT_AUTHOR}"
+
+  apply:
+    needs: authorize
+    if: needs.authorize.outputs.should-run == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write # OIDC for AWS
+      contents: read # to read the Terraform config
+      pull-requests: write # to report the result as a comment
+      statuses: write # to emit the status check the consumer gates merge on
+      actions: read # to find and download the stored plan artifact
+    outputs:
+      applied: ${{ steps.apply.outputs.applied }}
+    steps:
+      - name: Compute identifiers
+        id: names
+        env:
+          ENV_NAME: ${{ inputs.name }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$ENV_NAME" | grep -Eq '^[A-Za-z0-9._-]{1,64}$'; then
+            echo "::error::input 'name' must match [A-Za-z0-9._-]{1,64}, got '${ENV_NAME}'"
+            exit 1
+          fi
+          echo "artifact=tfplan-${PR_NUMBER}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          echo "marker=<!-- terraform-apply:${ENV_NAME} -->" >> "$GITHUB_OUTPUT"
+          # AWS caps RoleSessionName at 64 characters. See the truncation note
+          # at the Authenticate to AWS step.
+          echo "session-slug=${ENV_NAME:0:40}" >> "$GITHUB_OUTPUT"
+
+      # TOCTOU. The authorize job resolved the head SHA, but that was a separate
+      # job: scheduling and runner acquisition sit between it and here, commonly
+      # tens of seconds, and a push landing in that window would be invisible to
+      # a comparison against the cached value. The staleness check exists
+      # precisely to stop an apply at a commit that is no longer the PR head, so
+      # it must compare against the head as it is NOW, not as it was at
+      # authorisation time.
+      #
+      # Read once, here, and use this value for everything downstream — artifact
+      # provenance, the staleness comparison, the checkout, and the commit
+      # status — so all four refer to the same commit. A push after this read
+      # is still possible, but Terraform's own lineage/serial check backstops it
+      # and the window is now a few seconds rather than the whole job gap.
+      - name: Re-read the current PR head
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          AUTHORIZED_HEAD: ${{ needs.authorize.outputs.head-sha }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+
+          if [ -z "$current" ] || [ "$current" = "null" ]; then
+            echo "::error::could not read the current head SHA for #${PR_NUMBER}"
+            exit 1
+          fi
+
+          if [ "$current" != "$AUTHORIZED_HEAD" ]; then
+            echo "::warning::PR head moved from ${AUTHORIZED_HEAD} to ${current} since authorisation"
+          fi
+
+          echo "sha=${current}" >> "$GITHUB_OUTPUT"
+          echo "current head is ${current}"
+
+      # Report "pending" before anything slow happens, so the status check the
+      # consumer gates merge on reflects an apply in flight rather than sitting
+      # absent until the run finishes.
+      - name: Report the apply as pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          CONTEXT: ${{ needs.authorize.outputs.status-check }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=pending \
+            -f context="${CONTEXT}" \
+            -f description="apply in progress" \
+            -f target_url="${RUN_URL}" >/dev/null
+
+      # download-artifact defaults `run-id` to the CURRENT run, and the plan was
+      # uploaded by a different one — the terraform-plan run. Without an
+      # explicit run-id every download here would look in this run, find
+      # nothing, and report "no stored plan" no matter how recently the plan
+      # was made. So resolve the run holding the artifact first.
+      #
+      # PROVENANCE. Selecting on artifact NAME alone is not sufficient, because
+      # every downstream gate reads its inputs out of the artifact: the destroy
+      # re-check takes destroy_count from plan-meta.json, the staleness check
+      # takes head_sha, the Terraform version comes from it, and the binary
+      # tfplan that gets applied is whatever was uploaded. Artifact names are
+      # fully predictable (tfplan-<pr>-<env>), and any workflow run in this
+      # repository can upload an artifact under any name — so a lookalike
+      # declaring destroy_count 0 and a matching head_sha would pass every gate
+      # and be applied. Name matching is therefore treated as a search filter,
+      # never as proof of origin.
+      #
+      # An artifact is accepted only when BOTH hold:
+      #   * its producing run is a non-fork run of this repository
+      #     (head_repository_id == repository_id, both assigned by GitHub and
+      #     not settable by a run), and
+      #   * the plan-meta.json INSIDE it records this environment, this PR, and
+      #     the PR head as it is now.
+      # Anything else is refused rather than applied.
+      #
+      # WHY CONTENTS, NOT RUN METADATA. Provenance used to be checked against
+      # the producing run's `.path` and `head_sha`. Both are wrong for a
+      # reusable workflow:
+      #
+      #   * `.path` is the workflow file that was TRIGGERED. terraform-plan.yml
+      #     is invoked via `uses:`, so in a consumer repository the triggered
+      #     file is the consumer's own caller (e.g. .github/workflows/
+      #     terraform.yml) and `.path` never equals this file. A called
+      #     reusable workflow appears in `.referenced_workflows[]` instead. The
+      #     comparison value was also hardcoded, which would have required
+      #     every consumer to name its caller identically.
+      #   * On the `/plan` (issue_comment) path the producing run's `head_sha`
+      #     is the DEFAULT BRANCH commit, because issue_comment runs in
+      #     base-branch context — never the PR head.
+      #
+      # Both tests therefore failed for every real consumer, refusing every
+      # `/apply` as "untrusted". It failed closed, so no AWS access leaked, but
+      # the workflow was non-functional and the documented allow-destroy loop
+      # (add the label, re-run `/plan`, then `/apply`) was silently broken.
+      #
+      # plan-meta.json is written by the plan job inside THIS repository's
+      # reusable workflow, at plan time, from trusted context values. Forging
+      # it is not enough on its own: the artifact must still arrive from a
+      # non-fork run of this repository, which the head_repository_id filter
+      # above enforces and which no run can fake. Terraform's own lineage and
+      # serial check backstops a stale binary plan.
+      - name: Locate the plan, verifying its recorded provenance
+        id: locate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ARTIFACT: ${{ steps.names.outputs.artifact }}
+          # The freshly read head, not the authorise-time snapshot, so the plan
+          # is bound to the commit this run will actually apply.
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          ENV_NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+
+          artifacts=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" --paginate \
+                        --jq '[.artifacts[] | select(.expired == false)]' \
+                      | jq -s 'add // []')
+
+          # Candidates: right name, unexpired, and produced by a run of this
+          # repository itself rather than a fork.
+          #
+          # Ordering is load-bearing — the first candidate whose recorded
+          # provenance verifies is the one applied, so it must be the NEWEST.
+          # The previous `sort_by(.created_at) | reverse | map(...) | unique`
+          # did the opposite: jq's `unique` re-sorts its input numerically and
+          # threw the recency ordering away, so the OLDEST run was always
+          # picked. Dedupe first via group_by (taking each run's most recent
+          # artifact), and sort last, so nothing re-orders after the sort.
+          candidates=$(jq -r --arg n "$ARTIFACT" '
+            [ .[]
+              | select(.name == $n)
+              | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
+            ]
+            | group_by(.workflow_run.id)
+            | map(max_by(.created_at))
+            | sort_by(.created_at) | reverse
+            | map(.workflow_run.id)
+            | .[]' <<<"$artifacts")
+
+          if [ -z "$candidates" ]; then
+            echo "::warning::no unexpired '${ARTIFACT}' artifact from a non-fork run of ${REPO}"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            # Not a failure yet: "Verify a plan exists" turns this into the
+            # user-facing refusal, so every refusal path reports identically.
+            exit 0
+          fi
+
+          # The provenance record is uploaded as its own artifact
+          # (<artifact>-meta) alongside the binary plan, so verification costs
+          # one small zip per candidate rather than the whole plan.
+          run_id=""
+          mismatch=""
+          mkdir -p meta-probe
+
+          for candidate in $candidates; do
+            rm -rf meta-probe/*
+            # Piped into jq rather than using `gh --jq`: `gh api` has no --arg
+            # flag, so the artifact name has to be bound by jq itself. Passing
+            # it as a --arg avoids interpolating a shell value into a jq
+            # program.
+            meta_id=$(gh api "repos/${REPO}/actions/runs/${candidate}/artifacts?per_page=100" 2>/dev/null \
+                      | jq -r --arg n "${ARTIFACT}-meta" \
+                          'first(.artifacts[] | select(.name == $n and .expired == false) | .id) // empty' \
+                      || true)
+
+            if [ -z "$meta_id" ]; then
+              echo "::warning::ignoring run ${candidate}: no unexpired '${ARTIFACT}-meta' provenance artifact"
+              mismatch="${mismatch}run ${candidate}: no provenance record; "
+              continue
+            fi
+
+            if ! gh api "repos/${REPO}/actions/artifacts/${meta_id}/zip" \
+                   > meta-probe/meta.zip 2>/dev/null; then
+              echo "::warning::ignoring run ${candidate}: provenance artifact could not be downloaded"
+              mismatch="${mismatch}run ${candidate}: provenance download failed; "
+              continue
+            fi
+
+            if ! unzip -o -q meta-probe/meta.zip -d meta-probe 2>/dev/null \
+               || [ ! -f meta-probe/plan-meta.json ]; then
+              echo "::warning::ignoring run ${candidate}: provenance artifact holds no plan-meta.json"
+              mismatch="${mismatch}run ${candidate}: no plan-meta.json in provenance artifact; "
+              continue
+            fi
+
+            # FAIL CLOSED on unreadable JSON. A provenance record that cannot
+            # be parsed proves nothing, so it is a reason to refuse rather
+            # than a reason to fall through to defaults.
+            if ! jq -e 'type == "object"' meta-probe/plan-meta.json >/dev/null 2>&1; then
+              echo "::warning::ignoring run ${candidate}: plan-meta.json is not a JSON object"
+              mismatch="${mismatch}run ${candidate}: unreadable plan-meta.json; "
+              continue
+            fi
+
+            got_sha=$(jq -r '.head_sha // empty' meta-probe/plan-meta.json)
+            got_pr=$(jq -r '.pr_number // empty' meta-probe/plan-meta.json)
+            got_env=$(jq -r '.environment // empty' meta-probe/plan-meta.json)
+
+            if [ "$got_sha" != "$HEAD_SHA" ]; then
+              echo "::warning::ignoring run ${candidate}: planned at '${got_sha:-<missing>}', PR head is ${HEAD_SHA}"
+              mismatch="${mismatch}run ${candidate}: head_sha ${got_sha:-<missing>} != ${HEAD_SHA}; "
+              continue
+            fi
+            if [ "$got_pr" != "$PR_NUMBER" ]; then
+              echo "::warning::ignoring run ${candidate}: planned for PR '${got_pr:-<missing>}', this is #${PR_NUMBER}"
+              mismatch="${mismatch}run ${candidate}: pr_number ${got_pr:-<missing>} != ${PR_NUMBER}; "
+              continue
+            fi
+            if [ "$got_env" != "$ENV_NAME" ]; then
+              echo "::warning::ignoring run ${candidate}: planned for environment '${got_env:-<missing>}', this is '${ENV_NAME}'"
+              mismatch="${mismatch}run ${candidate}: environment ${got_env:-<missing>} != ${ENV_NAME}; "
+              continue
+            fi
+
+            run_id="$candidate"
+            break
+          done
+
+          rm -rf meta-probe
+
+          if [ -z "$run_id" ]; then
+            echo "::error title=No trusted plan::an artifact named '${ARTIFACT}' exists but none records a plan for PR #${PR_NUMBER}, environment '${ENV_NAME}', at ${HEAD_SHA}"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "untrusted=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "mismatch<<MISMATCH_EOF"
+              echo "${mismatch%; }"
+              echo "MISMATCH_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "run-id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "verified plan '${ARTIFACT}' from run ${run_id}: PR #${PR_NUMBER}, environment '${ENV_NAME}', commit ${HEAD_SHA}"
+
+      - name: Download the stored plan
+        id: download
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: ${{ steps.names.outputs.artifact }}
+          path: plan-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.locate.outputs.run-id }}
+
+      - name: Download the plan provenance
+        id: download-meta
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: ${{ steps.names.outputs.artifact }}-meta
+          path: meta-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.locate.outputs.run-id }}
+
+      - name: Verify a plan exists
+        id: verify-exists
+        env:
+          DL: ${{ steps.download.outcome }}
+          DL_META: ${{ steps.download-meta.outcome }}
+          UNTRUSTED: ${{ steps.locate.outputs.untrusted }}
+          MISMATCH: ${{ steps.locate.outputs.mismatch }}
+          ENV_NAME: ${{ inputs.name }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # An artifact of the right name existed but failed provenance
+          # verification. Distinguished from "no plan at all" because the causes
+          # and the remedies are completely different, and because silently
+          # reporting "no stored plan" would hide a possible substitution
+          # attempt from the maintainer who needs to see it.
+          #
+          # The message reports what actually failed to match. The usual cause
+          # is mundane — a plan made before the last push, so its recorded
+          # head_sha is simply the previous commit — and a message that named
+          # only "untrusted" sent maintainers hunting for an attack that had
+          # not happened.
+          if [ "${UNTRUSTED:-}" = "true" ]; then
+            echo "::error title=Unverified plan artifact::refusing to apply a plan whose recorded provenance does not match this PR"
+            reason="$(
+              printf 'A plan artifact named for `%s` exists, but none of the candidates records a plan matching this pull request, so it was refused.\n\n' "${ENV_NAME}"
+              printf 'Expected the plan to record environment `%s`, PR `%s`, and commit `%s`.\n\n' \
+                "${ENV_NAME}" "${PR_NUMBER}" "${HEAD_SHA:0:7}"
+              if [ -n "${MISMATCH:-}" ]; then
+                printf 'What was found instead: %s\n\n' "${MISMATCH}"
+              fi
+              printf 'Most often this simply means the plan predates the current commit. Run `/plan %s` to produce a plan for the current head, then `/apply %s`.\n' \
+                "${ENV_NAME}" "${ENV_NAME}"
+            )"
+            {
+              echo "reason<<REASON_EOF"
+              echo "$reason"
+              echo "REASON_EOF"
+              echo "ok=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # DL is "skipped" when the locate step found no artifact at all, and
+          # "failure" when the download itself failed. Both mean the same thing
+          # to the user, so they share one message.
+          if [ "$DL" != "success" ] || [ ! -f plan-download/tfplan ]; then
+            echo "::error title=No stored plan::no plan artifact for '${ENV_NAME}' on this PR"
+            echo "reason=No stored plan was found for \`${ENV_NAME}\`. Run \`/plan ${ENV_NAME}\` first. A plan also expires when its artifact is deleted or its retention window passes." >> "$GITHUB_OUTPUT"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$DL_META" != "success" ] || [ ! -f meta-download/plan-meta.json ]; then
+            echo "::error title=Plan provenance missing::cannot verify what this plan was made against"
+            echo "reason=The plan for \`${ENV_NAME}\` has no provenance record, so its commit cannot be verified. Re-run \`/plan ${ENV_NAME}\`." >> "$GITHUB_OUTPUT"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # STALENESS. Terraform's saved plan records the state lineage and serial
+      # and refuses to apply with "Error: Saved plan is stale" if the state has
+      # moved — that check is not reimplemented here, and no re-plan-and-compare
+      # is done, because Terraform's version is stricter.
+      #
+      # What Terraform cannot see is the commit. A plan made at commit A is
+      # still perfectly applyable at commit B if the state never moved, so
+      # reviewing A and applying it after B was pushed would apply
+      # unreviewed-but-unchanged infrastructure changes. That gap is this step.
+      - name: Refuse a plan made against a different commit
+        id: staleness
+        if: steps.verify-exists.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          ENV_NAME: ${{ inputs.name }}
+          WORKDIR: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          cat meta-download/plan-meta.json
+
+          # Re-read the head here rather than trusting any earlier value. The
+          # artifact was already bound to a freshly read SHA when it was
+          # located, but a push can land between that step and this one too, and
+          # this is the last comparison before AWS is touched. Comparing against
+          # a cached snapshot would mean comparing the plan to where the PR used
+          # to be.
+          CURRENT_HEAD=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          if [ -z "$CURRENT_HEAD" ] || [ "$CURRENT_HEAD" = "null" ]; then
+            echo "::error::could not re-read the current head SHA for #${PR_NUMBER}"
+            exit 1
+          fi
+          echo "current head at staleness check: ${CURRENT_HEAD}"
+
+          plan_sha=$(jq -r '.head_sha' meta-download/plan-meta.json)
+          plan_env=$(jq -r '.environment' meta-download/plan-meta.json)
+          plan_dir=$(jq -r '.working_directory' meta-download/plan-meta.json)
+          plan_tf=$(jq -r '.terraform_version' meta-download/plan-meta.json)
+
+          # The checkout and the commit status both use this, so all of them
+          # refer to the one commit this step verified.
+          echo "head-sha=${CURRENT_HEAD}" >> "$GITHUB_OUTPUT"
+
+          echo "terraform-version=${plan_tf}" >> "$GITHUB_OUTPUT"
+          echo "plan-sha=${plan_sha}" >> "$GITHUB_OUTPUT"
+
+          fail=""
+
+          if [ "$plan_sha" != "$CURRENT_HEAD" ]; then
+            echo "::error title=Stale plan::plan was made at ${plan_sha}, PR head is now ${CURRENT_HEAD}"
+            # printf, not a multi-line string literal: an unindented
+            # continuation line would terminate the enclosing YAML block scalar.
+            fail="$(
+              printf 'The stored plan for `%s` was made against commit `%s`, but this pull request now points at `%s`.\n\n' \
+                "${ENV_NAME}" "${plan_sha:0:7}" "${CURRENT_HEAD:0:7}"
+              printf "Terraform itself would not catch this: a saved plan records the state's lineage and serial, "
+              printf 'not the commit, so it applies cleanly as long as the state has not moved. Applying it would put '
+              printf 'the reviewed plan for an older commit into effect while the PR shows newer code.\n\n'
+              printf 'Run `/plan %s` to plan the current commit, then `/apply %s`.\n' "${ENV_NAME}" "${ENV_NAME}"
+            )"
+          elif [ "$plan_env" != "$ENV_NAME" ]; then
+            echo "::error title=Environment mismatch::plan is for '${plan_env}', this job is '${ENV_NAME}'"
+            fail="The stored plan claims environment \`${plan_env}\` but this job is \`${ENV_NAME}\`. Nothing was applied."
+          elif [ "$plan_dir" != "$WORKDIR" ]; then
+            echo "::error title=Directory mismatch::plan was made in '${plan_dir}', this job uses '${WORKDIR}'"
+            fail="The stored plan was made in \`${plan_dir}\` but this job is configured for \`${WORKDIR}\`. The plan and apply jobs disagree about which root module this environment is. Nothing was applied."
+          fi
+
+          if [ -n "$fail" ]; then
+            {
+              echo "ok=false"
+              echo "reason<<REASON_EOF"
+              echo "$fail"
+              echo "REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "OK: plan matches PR head ${CURRENT_HEAD}"
+
+      # Re-checked at apply time rather than trusted from the plan run. The
+      # label may have been removed since, and this is the last gate before a
+      # destroy actually happens.
+      - name: Re-check the destroy guard
+        id: destroy-guard
+        if: steps.staleness.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          ENV_NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+
+          # FAIL CLOSED, exactly as in the plan-side guard. `// "0"` would treat
+          # a missing, null or malformed destroy_count as "destroys nothing" —
+          # the single most dangerous possible default for the last gate before
+          # a real destroy. A provenance record that cannot be read is a reason
+          # to refuse, not a reason to proceed.
+          if ! jq -e 'type == "object"' meta-download/plan-meta.json >/dev/null 2>&1; then
+            echo "::error title=Unreadable provenance::plan-meta.json is not a JSON object"
+            {
+              echo "ok=false"
+              echo "reason<<REASON_EOF"
+              echo "The plan provenance for \`${ENV_NAME}\` could not be read, so the destroy count cannot be verified. Nothing was applied. Run \`/plan ${ENV_NAME}\` to produce a fresh plan."
+              echo "REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          destroys=$(jq -r '.destroy_count // empty' meta-download/plan-meta.json)
+
+          if ! printf '%s' "$destroys" | grep -Eq '^[0-9]+$'; then
+            echo "::error title=Unverifiable destroy count::destroy_count is '${destroys:-<missing>}', not a number"
+            {
+              echo "ok=false"
+              echo "reason<<REASON_EOF"
+              echo "The plan provenance for \`${ENV_NAME}\` records no usable \`destroy_count\` (found \`${destroys:-<missing>}\`), so this apply cannot be shown to be non-destructive. Nothing was applied. Run \`/plan ${ENV_NAME}\` to produce a fresh plan."
+              echo "REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$destroys" -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "OK: plan destroys nothing"
+            exit 0
+          fi
+
+          has_label=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+                        --jq 'any(.[]; .name == "allow-destroy")')
+
+          if [ "$has_label" != "true" ]; then
+            echo "::error title=Destructive apply blocked::plan destroys ${destroys} resource(s) and the 'allow-destroy' label is absent"
+            {
+              echo "ok=false"
+              echo "reason<<REASON_EOF"
+              echo "The stored plan for \`${ENV_NAME}\` destroys **${destroys}** resource(s) and this pull request does not carry the \`allow-destroy\` label. Nothing was applied."
+              echo "REASON_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::applying a plan that destroys ${destroys} resource(s); permitted by the 'allow-destroy' label"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # Only reached once the plan exists, matches the PR head, and the destroy
+      # guard is satisfied. Nothing before this point authenticated to AWS.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.destroy-guard.outputs.ok == 'true'
+        with:
+          # The freshly verified head, which the staleness step has just proven
+          # equal to the commit the plan was made against. Using the
+          # authorise-time snapshot here would reintroduce the TOCTOU gap by
+          # checking out a commit nothing re-verified.
+          ref: ${{ steps.staleness.outputs.head-sha }}
+          persist-credentials: false
+          path: repo
+
+      # $/, resolving aws-auth at this workflow's own commit — see the same
+      # step in terraform-plan.yml for the reasoning against a pinned
+      # aws-auth/v0 ref. ADR 0001, "Composition uses $/, never ./".
+      #
+      # mask-aws-account-id is deliberately "true" for public-repository log
+      # hygiene. It makes aws-auth's `account-id` output empty by design — a
+      # masked value cannot cross a step output — so a future step needing the
+      # account ID must ask STS rather than read that output.
+      - name: Authenticate to AWS
+        if: steps.destroy-guard.outputs.ok == 'true'
+        uses: $/aws-auth
+        with:
+          role-arn: ${{ inputs.aws-role-arn }}
+          region: ${{ inputs.aws-region }}
+          # Truncated to fit AWS's 64-character RoleSessionName cap. The fixed
+          # overhead here is 21 characters (tf-apply- plus separator plus an
+          # 11-digit run_id), so an untruncated 64-character `name` would be
+          # rejected by STS with an opaque ValidationError.
+          role-session-name: tf-apply-${{ steps.names.outputs.session-slug }}-${{ github.run_id }}
+          mask-aws-account-id: "true"
+
+      - name: Set up Terraform
+        if: steps.destroy-guard.outputs.ok == 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          # The exact version that wrote the plan. A saved plan is only reliably
+          # readable by the version that produced it, so resolving "latest"
+          # again here could fail to read a plan made minutes earlier.
+          terraform_version: ${{ steps.staleness.outputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        if: steps.destroy-guard.outputs.ok == 'true'
+        working-directory: repo/${{ inputs.working-directory }}
+        env:
+          INIT_ARGS: ${{ inputs.terraform-init-args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          terraform init -input=false -no-color ${INIT_ARGS}
+
+      # Every gate has passed and the next step changes real infrastructure.
+      # This is what the rocket on the command comment actually means.
+      - name: Acknowledge that the apply is starting
+        if: steps.destroy-guard.outputs.ok == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ needs.authorize.outputs.comment-id }}
+        run: |
+          set -euo pipefail
+          [ -n "${COMMENT_ID:-}" ] || exit 0
+          gh api --method POST \
+            "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='rocket' >/dev/null || true
+
+      - name: terraform apply
+        id: apply
+        if: steps.destroy-guard.outputs.ok == 'true'
+        working-directory: repo/${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          cp "${GITHUB_WORKSPACE}/plan-download/tfplan" ./tfplan
+
+          echo "applied=false" >> "$GITHUB_OUTPUT"
+
+          # Applying the saved plan file, not re-planning. This is where
+          # Terraform's own lineage/serial check fires: if the state moved since
+          # the plan was made it refuses with "Saved plan is stale", which is
+          # stricter than any commit comparison because it tracks state rather
+          # than code.
+          set +e
+          terraform apply -input=false -no-color -lock-timeout=5m tfplan > apply.txt 2>&1
+          code=$?
+          set -e
+
+          cat apply.txt
+
+          if [ "$code" -ne 0 ]; then
+            if grep -q 'Saved plan is stale' apply.txt; then
+              echo "::error title=Saved plan is stale::the Terraform state moved after this plan was made; re-plan"
+              echo "stale-state=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "::error::terraform apply failed"
+            exit 1
+          fi
+
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report the result on the pull request
+        # always(), so a refusal or a failed apply is reported too — a silent
+        # failure here would leave the status check pending forever.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr-number }}
+          # The status must land on the commit this run actually reported
+          # pending against, which is the freshly read head. The authorise-time
+          # value is the last-resort fallback for a failure so early that even
+          # the head re-read did not run.
+          HEAD_SHA: ${{ steps.head.outputs.sha || needs.authorize.outputs.head-sha }}
+          CONTEXT: ${{ needs.authorize.outputs.status-check }}
+          MARKER: ${{ steps.names.outputs.marker }}
+          ENV_NAME: ${{ inputs.name }}
+          ACTOR: ${{ needs.authorize.outputs.actor }}
+          APPLIED: ${{ steps.apply.outputs.applied }}
+          STALE_STATE: ${{ steps.apply.outputs.stale-state }}
+          EXISTS_REASON: ${{ steps.verify-exists.outputs.reason }}
+          STALE_REASON: ${{ steps.staleness.outputs.reason }}
+          GUARD_REASON: ${{ steps.destroy-guard.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          body_file="$(mktemp)"
+          refusal=""
+          for r in "$EXISTS_REASON" "$STALE_REASON" "$GUARD_REASON"; do
+            if [ -n "$r" ]; then refusal="$r"; break; fi
+          done
+
+          if [ "$APPLIED" = "true" ]; then
+            state="success"
+            description="applied by ${ACTOR}"
+            {
+              echo "${MARKER}"
+              echo "### Terraform apply — \`${ENV_NAME}\` — succeeded"
+              echo ""
+              echo "> [!NOTE]"
+              echo "> Applied the stored plan at commit \`${HEAD_SHA:0:7}\`, requested by @${ACTOR}."
+              echo ""
+              # The apply body is NOT posted. Terraform echoes resource
+              # attributes as they are created, which is the output most likely
+              # to contain a value a provider did not mark sensitive. The job
+              # log is visible only to users who can read the Actions tab; a PR
+              # comment on a public repository is visible to everyone.
+              echo "Output is in the [job log](${RUN_URL}) — it is deliberately not mirrored here,"
+              echo "because apply output echoes resource attributes and can carry secrets."
+              echo ""
+              echo "<sub>commit \`${HEAD_SHA:0:7}\` · [run](${RUN_URL})</sub>"
+            } > "$body_file"
+          elif [ -n "$refusal" ]; then
+            state="failure"
+            description="refused: nothing applied"
+            {
+              echo "${MARKER}"
+              echo "### Terraform apply refused — \`${ENV_NAME}\`"
+              echo ""
+              echo "> [!CAUTION]"
+              echo "> **Nothing was applied.**"
+              echo ""
+              echo "${refusal}"
+              echo ""
+              echo "<sub>requested by @${ACTOR} · [run](${RUN_URL})</sub>"
+            } > "$body_file"
+          else
+            state="failure"
+            description="apply failed"
+            {
+              echo "${MARKER}"
+              echo "### Terraform apply — \`${ENV_NAME}\` — FAILED"
+              echo ""
+              echo "> [!CAUTION]"
+              echo "> The apply started and did not complete. **Infrastructure may be partially changed.**"
+              echo "> Inspect the [job log](${RUN_URL}) and the Terraform state before retrying."
+              echo ""
+              if [ "${STALE_STATE:-}" = "true" ]; then
+                echo "Terraform reported \`Saved plan is stale\`: the state moved after this plan was"
+                echo "made, so nothing was applied. Run \`/plan ${ENV_NAME}\` and apply the new plan."
+                echo ""
+              fi
+              echo "<sub>requested by @${ACTOR} · commit \`${HEAD_SHA:0:7}\` · [run](${RUN_URL})</sub>"
+            } > "$body_file"
+          fi
+
+          # The status check the consumer's ruleset gates merge on.
+          gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state="${state}" \
+            -f context="${CONTEXT}" \
+            -f description="${description}" \
+            -f target_url="${RUN_URL}" >/dev/null
+
+          # A new comment each time, not an update. An apply is an event with a
+          # real-world effect and the history of attempts matters; a plan is a
+          # statement about the current commit, which is why that one is updated
+          # in place instead.
+          gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -F body=@"$body_file" >/dev/null
+
+          echo "reported ${state}: ${description}"
+
+      - name: Fail the job if nothing was applied
+        if: always() && steps.apply.outputs.applied != 'true'
+        run: |
+          set -euo pipefail
+          echo "::error::apply did not complete; see the pull request comment"
+          exit 1

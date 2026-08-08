@@ -1,0 +1,822 @@
+name: terraform-plan
+
+# Reusable workflow: plan one Terraform environment on a pull request, post the
+# result as a PR comment, and fail the check if the plan destroys anything.
+#
+# Atlantis model (issue #3): the plan is a PR artifact and the apply happens on
+# the PR, never after merge. This workflow produces the saved plan file that
+# terraform-apply.yml later consumes.
+#
+# The versioned component for this file is the terraform-plan/ directory —
+# reusable workflows must live flat in .github/workflows/, and release-please
+# can only version directories. See ADR 0001, and terraform-plan/README.md for
+# consumer usage.
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: >-
+          Environment name. This is the identity of the environment everywhere:
+          the comment command that targets it (/plan <name>), the artifact the
+          plan is stored under, the key of the PR comment that gets updated in
+          place, and the status check terraform-apply reports. Must be unique
+          across the caller's jobs and stable across runs — renaming it orphans
+          any plan already stored for the PR.
+        required: true
+        type: string
+      working-directory:
+        description: >-
+          Directory holding the Terraform root module for this environment,
+          relative to the repository root, e.g. terraform/environments/development.
+        required: true
+        type: string
+      aws-role-arn:
+        description: >-
+          ARN of the IAM role to assume via OIDC. Supply from a caller-side
+          variable such as vars.AWS_ROLE_ARN; never hardcode an ARN.
+        required: true
+        type: string
+      aws-region:
+        description: AWS region for the plan.
+        required: false
+        default: us-west-2
+        type: string
+      terraform-version:
+        description: >-
+          Terraform version constraint passed to setup-terraform. Pin this to an
+          exact version in production: a saved plan is only guaranteed readable
+          by the same Terraform version that wrote it, and terraform-apply reads
+          this back from the plan metadata to install a matching version.
+        required: false
+        default: latest
+        type: string
+      var-file:
+        description: >-
+          Optional -var-file passed to plan, relative to working-directory.
+          Empty means none.
+        required: false
+        default: ""
+        type: string
+      terraform-init-args:
+        description: >-
+          Extra arguments appended to terraform init, e.g. backend config.
+          Word-split on whitespace.
+        required: false
+        default: ""
+        type: string
+      runs-on:
+        description: Runner label for the plan job.
+        required: false
+        default: ubuntu-latest
+        type: string
+      artifact-retention-days:
+        description: >-
+          How long the saved plan is kept. A plan is applyable for exactly as
+          long as its artifact exists, so this is the real expiry of an
+          outstanding /apply.
+        required: false
+        default: 5
+        type: number
+      comment-plan-output:
+        description: >-
+          Whether to post the human-readable plan body into the PR comment. A
+          Terraform plan can echo secrets — anything a provider marks
+          non-sensitive is rendered in full, and the repository is very often
+          public. Set false to post only the change counts and the destroy
+          verdict, leaving the body in the (login-gated) job log.
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      has-destroys:
+        description: '"true" when the plan destroys or replaces at least one resource.'
+        value: ${{ jobs.plan.outputs.has-destroys }}
+      destroy-count:
+        description: Number of resources the plan would delete, replacements included.
+        value: ${{ jobs.plan.outputs.destroy-count }}
+      plan-artifact:
+        description: Name of the artifact holding the saved plan.
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+
+# No blanket grant. Every job below states exactly what it needs.
+permissions: {}
+
+# One plan per environment per PR. A superseded plan is worthless — it is about
+# to be replaced by one for a newer commit — so cancel it rather than letting
+# two runs race to update the same comment.
+#
+# github.event.issue.number is in the fallback chain and is load-bearing. On an
+# issue_comment event github.event.pull_request is null and github.ref is the
+# DEFAULT BRANCH ref, not the PR's — so without it every comment-triggered plan
+# across every open PR collapses into one group and, with cancel-in-progress,
+# a /plan on one PR silently cancels the in-flight plan on another.
+# github.event.issue.number is the PR number when the comment is on a PR.
+concurrency:
+  group: terraform-plan-${{ inputs.name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Resolve which PR and which commit this run is about. `pull_request` gives
+  # this directly; a `/plan <name>` comment does not, because issue_comment has
+  # no head SHA in its payload — it must be fetched.
+  #
+  # This job also holds the authorisation gate. It runs BEFORE any checkout of
+  # PR head code, so an unauthorised commenter never reaches a step that can
+  # execute their Terraform.
+  context:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # to react to and reply to the command comment
+    outputs:
+      should-run: ${{ steps.decide.outputs.should-run }}
+      pr-number: ${{ steps.decide.outputs.pr-number }}
+      head-sha: ${{ steps.decide.outputs.head-sha }}
+    steps:
+      - name: Decide whether this run applies to this environment
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ENV_NAME: ${{ inputs.name }}
+          # The comment body is untrusted input from an arbitrary internet user.
+          # It goes through the environment, never interpolated into the script
+          # body, so it is data to bash and can never become code.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+          PR_FROM_EVENT: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Fork detection. head.repo is null when the fork has been deleted, so
+          # an empty value must never compare equal to BASE_REPO below.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "should-run=false" >> "$GITHUB_OUTPUT"
+
+          # ---------------------------------------------------------------
+          # pull_request_target is NEVER acceptable for this workflow. It runs
+          # in base-branch context with a fully privileged token and full
+          # secret access even for fork PRs, and this workflow checks out PR
+          # head and executes it (terraform init/plan run provider code,
+          # `external` data sources and local-exec). That combination is the
+          # canonical fork-PR credential exfiltration pattern. Refuse loudly
+          # rather than ignoring it: a consumer who wires it up must find out
+          # from a failed run, not from a plan that quietly succeeded.
+          # ---------------------------------------------------------------
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error title=Unsupported trigger::terraform-plan must never be called from a pull_request_target trigger"
+            echo "pull_request_target grants a privileged token and full secret access to a run"
+            echo "whose head commit is PR-author-controlled. This workflow checks out and EXECUTES"
+            echo "that code, so the combination hands repository credentials and the AWS role to"
+            echo "any fork author. Use 'on: pull_request' instead."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # ---------------------------------------------------------------
+            # FORK GATE. This is the gate for the automatic path, and it must
+            # stay ahead of everything that authenticates to AWS.
+            #
+            # There is no collaborator check to lean on here: pull_request
+            # fires for any fork PR from any internet user. The plan job that
+            # follows checks out PR head and holds `id-token: write`, and
+            # aws-role-arn is a workflow *input*, not a secret, so it is
+            # present on fork runs too — nothing downstream would withhold the
+            # AWS role. So the refusal happens here, before the plan job is
+            # ever reached.
+            # ---------------------------------------------------------------
+            if [ -z "$HEAD_REPO" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+              echo "::notice title=Fork pull request — not planned automatically::a maintainer must review this PR before planning it"
+              echo "head repository '${HEAD_REPO:-<deleted>}' is not '${BASE_REPO}'."
+              echo ""
+              echo "Planning runs the pull request's Terraform — provider code, 'external' data"
+              echo "sources and local-exec all execute on the runner with the environment's AWS"
+              echo "role. Doing that automatically for code any internet user can push would hand"
+              echo "the AWS role to that user, so fork PRs are never planned automatically."
+              echo ""
+              echo "A maintainer with write access may review the diff and then comment"
+              echo "'/plan ${ENV_NAME}' to plan it deliberately."
+              exit 0
+            fi
+
+            # Automatic plan on push to a same-repository (branch) PR.
+            {
+              echo "should-run=true"
+              echo "pr-number=${PR_FROM_EVENT}"
+              echo "head-sha=${PR_HEAD_SHA}"
+            } >> "$GITHUB_OUTPUT"
+            echo "plan triggered by ${EVENT_NAME} for '${ENV_NAME}'"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" != "issue_comment" ]; then
+            echo "event ${EVENT_NAME} does not trigger a plan"
+            exit 0
+          fi
+
+          # issue_comment fires for issues as well as PRs. An issue has no head
+          # commit and nothing to plan.
+          if [ "$IS_PR_COMMENT" != "true" ]; then
+            echo "comment is on an issue, not a pull request"
+            exit 0
+          fi
+
+          # Parse the command. Accepted only as the first non-blank line, so
+          # quoting someone else's "/apply production" in a reply cannot fire
+          # it. Trailing \r tolerated — the web UI submits CRLF.
+          first_line=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n1 || true)
+          command=$(printf '%s' "$first_line" | awk '{$1=$1; print}')
+
+          verb=$(printf '%s' "$command" | awk '{print $1}')
+          target=$(printf '%s' "$command" | awk '{print $2}')
+          extra=$(printf '%s' "$command" | awk '{print $3}')
+
+          if [ "$verb" != "/plan" ]; then
+            echo "not a /plan command"
+            exit 0
+          fi
+
+          # Reject "/plan development rm -rf" rather than ignoring the tail:
+          # silently accepting extra words trains people to think they mean
+          # something.
+          if [ -n "$extra" ]; then
+            echo "::warning::ignoring malformed command: expected '/plan <environment>'"
+            exit 0
+          fi
+
+          if [ -z "$target" ]; then
+            echo "::warning::'/plan' needs an environment name, e.g. '/plan ${ENV_NAME}'"
+            exit 0
+          fi
+
+          # Each caller job runs this workflow once per environment, so every
+          # job sees every /plan comment. Only the one that owns the named
+          # environment proceeds; the rest exit quietly. Without this, all
+          # environments would replan on any /plan.
+          if [ "$target" != "$ENV_NAME" ]; then
+            echo "command targets '${target}', this job is '${ENV_NAME}' — nothing to do"
+            exit 0
+          fi
+
+          # ---------------------------------------------------------------
+          # AUTHORISATION. issue_comment fires for ANY commenter on a public
+          # repository, and this workflow assumes an AWS role. Everything above
+          # is parsing; this is the gate.
+          # ---------------------------------------------------------------
+          permission=$(gh api "repos/${REPO}/collaborators/${COMMENT_AUTHOR}/permission" \
+                         --jq '.permission' 2>/dev/null || echo "none")
+
+          case "$permission" in
+            admin|write) ;;
+            *)
+              echo "::error::${COMMENT_AUTHOR} has '${permission}' permission; /plan requires write or admin"
+              gh api --method POST \
+                "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='-1' >/dev/null || true
+              gh api --method POST \
+                "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="@${COMMENT_AUTHOR} \`/plan\` requires **write** or **admin** permission on this repository; your permission level is \`${permission}\`. No plan was run." \
+                >/dev/null || true
+              exit 1
+              ;;
+          esac
+
+          # Authorised. Resolve the head SHA — issue_comment's payload has no
+          # commit, and the base-branch checkout it defaults to is not what we
+          # want to plan.
+          pr_json=$(gh api "repos/${REPO}/pulls/${ISSUE_NUMBER}")
+          head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          pr_state=$(jq -r '.state' <<<"$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // ""' <<<"$pr_json")
+
+          if [ "$pr_state" != "open" ]; then
+            echo "::warning::pull request #${ISSUE_NUMBER} is ${pr_state}; not planning"
+            exit 0
+          fi
+
+          # A maintainer /plan on a FORK PR is deliberately PERMITTED, and this
+          # is the only path by which fork code is ever planned.
+          #
+          # The reasoning: refusing forks outright would make the workflow
+          # useless for the open-source repositories it is aimed at, and the
+          # decision is not the workflow's to make — it belongs to a human who
+          # can read the diff. What the automatic path lacks is any human
+          # judgement at all, which is why it refuses; what this path adds is a
+          # named person with write access who typed the command after the diff
+          # was on screen. That is a real review step, not a rubber stamp.
+          #
+          # It is NOT a safety guarantee. Planning fork code runs that code with
+          # the environment's AWS role, so the maintainer is accepting exactly
+          # that. Announced in the log so the run is self-documenting and the
+          # decision is auditable after the fact.
+          if [ -n "$head_repo" ] && [ "$head_repo" != "$REPO" ]; then
+            echo "::warning title=Planning a fork pull request::${COMMENT_AUTHOR} requested a plan of fork code from '${head_repo}'"
+            echo "This plan executes Terraform authored in a fork, using this environment's AWS"
+            echo "role. It proceeds because ${COMMENT_AUTHOR} has write access and asked for it"
+            echo "explicitly — that maintainer is accepting the risk on review of the diff."
+          fi
+
+          gh api --method POST \
+            "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='rocket' >/dev/null || true
+
+          {
+            echo "should-run=true"
+            echo "pr-number=${ISSUE_NUMBER}"
+            echo "head-sha=${head_sha}"
+          } >> "$GITHUB_OUTPUT"
+          echo "authorised /plan for '${ENV_NAME}' at ${head_sha}"
+
+  plan:
+    needs: context
+    if: needs.context.outputs.should-run == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    # id-token for OIDC, contents to read the code, pull-requests to write the
+    # result comment. Deliberately no `contents: write` — a plan changes nothing
+    # in the repository, and this job executes PR-authored Terraform.
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    outputs:
+      has-destroys: ${{ steps.guard.outputs.has-destroys }}
+      destroy-count: ${{ steps.guard.outputs.destroy-count }}
+      plan-artifact: ${{ steps.names.outputs.artifact }}
+    steps:
+      - name: Compute artifact and comment identifiers
+        id: names
+        env:
+          ENV_NAME: ${{ inputs.name }}
+          PR_NUMBER: ${{ needs.context.outputs.pr-number }}
+        run: |
+          set -euo pipefail
+          # An environment name reaches the filesystem and the artifact API, so
+          # constrain it rather than trusting the caller. Artifact names forbid
+          # several characters outright.
+          if ! printf '%s' "$ENV_NAME" | grep -Eq '^[A-Za-z0-9._-]{1,64}$'; then
+            echo "::error::input 'name' must match [A-Za-z0-9._-]{1,64}, got '${ENV_NAME}'"
+            exit 1
+          fi
+          echo "artifact=tfplan-${PR_NUMBER}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          # Stable marker so each push updates one comment per environment
+          # rather than appending a new one every time.
+          echo "marker=<!-- terraform-plan:${ENV_NAME} -->" >> "$GITHUB_OUTPUT"
+          # AWS caps RoleSessionName at 64 characters and rejects longer ones.
+          # `name` permits 64 by itself, so truncate to what the fixed prefix
+          # and run_id leave room for rather than letting STS reject it.
+          echo "session-slug=${ENV_NAME:0:40}" >> "$GITHUB_OUTPUT"
+
+      # Checks out PR HEAD, which is code the PR author controls. See the
+      # security note in terraform-plan/README.md: this is the reason the
+      # authorisation gate sits in a separate job that runs first, why this job
+      # holds no `contents: write`, and why the AWS role must be scoped to what
+      # the environment genuinely needs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.context.outputs.head-sha }}
+          persist-credentials: false
+
+      # $/, not aws-auth@aws-auth/v0. $/ resolves against the repository and
+      # commit of the file containing it, so a consumer calling
+      # terraform-plan.yml@terraform-plan/v0.3.1 gets the aws-auth from that
+      # exact commit — one resolved ref, nothing to drift, and nothing for
+      # release-please to keep current (it does not rewrite refs). Pinning
+      # aws-auth/v0 here would instead mean a breaking aws-auth 0.x release
+      # silently changing the behaviour of an already-tagged terraform-plan,
+      # and pinning an exact version would need a manual bump on every
+      # aws-auth release. ADR 0001, "Composition uses $/, never ./".
+      #
+      # mask-aws-account-id is deliberately "true": this workflow is built for
+      # public repositories, where the job log is world-readable. The tradeoff
+      # is that aws-auth's `account-id` output is empty by design when masking
+      # is on — a masked value cannot cross a step output — so a future step
+      # needing the account ID must read it from STS itself rather than from
+      # that output. Documented here so nobody debugs the empty output.
+      - name: Authenticate to AWS
+        uses: $/aws-auth
+        with:
+          role-arn: ${{ inputs.aws-role-arn }}
+          region: ${{ inputs.aws-region }}
+          # Truncated to fit AWS's 64-character RoleSessionName cap. `name`
+          # allows up to 64 characters on its own, and the fixed overhead here
+          # (tf-plan- plus a separator plus an 11-digit run_id) is 20, so an
+          # untruncated name over 44 characters would fail inside STS with an
+          # opaque ValidationError long after `name` passed its own check.
+          role-session-name: tf-plan-${{ steps.names.outputs.session-slug }}-${{ github.run_id }}
+          mask-aws-account-id: "true"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          # The wrapper replaces the terraform binary with a script that
+          # captures stdout into step outputs. That breaks `terraform show
+          # -json | jq` — the destroy guard's entire input — so it stays off.
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          INIT_ARGS: ${{ inputs.terraform-init-args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          terraform init -input=false -no-color ${INIT_ARGS}
+
+      - name: terraform fmt and validate
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive -no-color || {
+            echo "::error::terraform fmt -check failed; run 'terraform fmt -recursive'"
+            exit 1
+          }
+          terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          VAR_FILE: ${{ inputs.var-file }}
+        run: |
+          set -euo pipefail
+
+          args=(-input=false -no-color -lock-timeout=5m -out=tfplan)
+          if [ -n "${VAR_FILE}" ]; then
+            if [ ! -f "${VAR_FILE}" ]; then
+              echo "::error::var-file '${VAR_FILE}' does not exist under $(pwd)"
+              exit 1
+            fi
+            args+=(-var-file="${VAR_FILE}")
+          fi
+
+          # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error. Without
+          # it a genuine failure and an empty plan are indistinguishable.
+          set +e
+          terraform plan "${args[@]}" -detailed-exitcode > plan.txt 2>&1
+          code=$?
+          set -e
+
+          # The plan body is echoed to the job log, which is visible only to
+          # users who can read the repository's Actions tab.
+          cat plan.txt
+
+          case "$code" in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::terraform plan failed"
+              echo "failed=true" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+
+      # THE DESTROY GUARD. Parses the machine-readable plan, never the human
+      # output: the rendered text varies between Terraform versions and is not
+      # a stable interface. A replacement is a delete plus a create and counts
+      # as a destroy — it is exactly as destructive.
+      - name: Destroy guard
+        id: guard
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.context.outputs.pr-number }}
+        run: |
+          set -euo pipefail
+
+          terraform show -json tfplan > plan.json
+
+          # FAIL CLOSED. Everything below derives the whole destroy verdict from
+          # this document, so an unreadable or unexpected one must be a hard
+          # error, never a zero-destroy pass.
+          #
+          # The counting expressions below deliberately do NOT use jq's `?`
+          # optional operator. `.resource_changes[]?` suppresses the error when
+          # the key is absent or is not an array and yields 0 — so a truncated
+          # write, a cross-version format change, or any unexpected shape would
+          # silently report "destroys nothing", mark the plan applyable, and
+          # write destroy_count 0 into the provenance the apply job trusts.
+          # Assert the shape first, then count without `?` so a regression
+          # surfaces as a failure instead of a false all-clear.
+          if ! jq -e 'type == "object"' plan.json >/dev/null 2>&1; then
+            echo "::error title=Unreadable plan::'terraform show -json' did not produce a JSON object"
+            echo "The destroy guard cannot verify what this plan does, so it is refused rather"
+            echo "than assumed safe. Inspect the job log for the terraform show output."
+            exit 1
+          fi
+
+          if ! jq -e 'has("resource_changes") and (.resource_changes | type == "array")' plan.json >/dev/null 2>&1; then
+            echo "::error title=Unexpected plan format::the plan JSON has no 'resource_changes' array"
+            echo "The destroy guard counts deletions from that array; without it the plan cannot"
+            echo "be verified as non-destructive, so it is refused. This usually means the plan"
+            echo "file was truncated or the Terraform version changed the JSON format."
+            jq -r 'keys | "top-level keys present: \(join(", "))"' plan.json || true
+            exit 1
+          fi
+
+          # A resource_change is a destroy when its actions include "delete".
+          # That covers:
+          #   ["delete"]             a plain destroy
+          #   ["delete","create"]    replacement (delete before create)
+          #   ["create","delete"]    replacement (create before destroy)
+          # and excludes ["no-op"], ["read"], ["create"], ["update"].
+          destroy_count=$(jq '[.resource_changes[] | select(.change.actions | index("delete"))] | length' plan.json)
+
+          create_count=$(jq '[.resource_changes[] | select(.change.actions == ["create"])] | length' plan.json)
+          update_count=$(jq '[.resource_changes[] | select(.change.actions == ["update"])] | length' plan.json)
+          replace_count=$(jq '[.resource_changes[] | select((.change.actions | index("delete")) and (.change.actions | index("create")))] | length' plan.json)
+
+          # A non-numeric count would sail through the `-eq 0` test below as a
+          # shell error under set -e, but be explicit about why.
+          for n in "$destroy_count" "$create_count" "$update_count" "$replace_count"; do
+            if ! printf '%s' "$n" | grep -Eq '^[0-9]+$'; then
+              echo "::error title=Destroy guard failed::change counting did not produce a number"
+              exit 1
+            fi
+          done
+
+          {
+            echo "destroy-count=${destroy_count}"
+            echo "create-count=${create_count}"
+            echo "update-count=${update_count}"
+            echo "replace-count=${replace_count}"
+          } >> "$GITHUB_OUTPUT"
+
+          # The addresses being destroyed, for the comment. Bounded, because a
+          # plan destroying a thousand resources must not produce a comment
+          # that exceeds GitHub's 65536-character body limit.
+          #
+          # No `?` and no `|| true`: the shape was asserted above, so a failure
+          # here is a real one and must not be swallowed into an empty list that
+          # would render a destroy comment naming nothing.
+          jq -r '[.resource_changes[] | select(.change.actions | index("delete")) | .address] | .[0:50] | .[]' \
+            plan.json > destroyed.txt
+
+          if [ "$destroy_count" -eq 0 ]; then
+            echo "has-destroys=false" >> "$GITHUB_OUTPUT"
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "OK: plan destroys nothing"
+            exit 0
+          fi
+
+          echo "has-destroys=true" >> "$GITHUB_OUTPUT"
+
+          # Read labels live from the API. The pull_request event payload is
+          # frozen at trigger time, so a label added in response to this very
+          # failure would not appear in it — the reviewer would add
+          # allow-destroy, re-run, and watch it fail again for no visible
+          # reason.
+          has_label=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+                        --jq 'any(.[]; .name == "allow-destroy")')
+
+          if [ "$has_label" = "true" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Destructive plan permitted::${destroy_count} resource(s) will be destroyed; the 'allow-destroy' label is present"
+            exit 0
+          fi
+
+          echo "allowed=false" >> "$GITHUB_OUTPUT"
+          echo "::error title=Destructive plan blocked::this plan destroys ${destroy_count} resource(s) and the PR has no 'allow-destroy' label"
+          sed 's/^/  - /' destroyed.txt
+          # Do not exit here. The comment must be posted first, or the reviewer
+          # sees a red check with no explanation. The gate step at the end fails
+          # the job.
+
+      # Upload before the guard's verdict is enforced. A blocked plan is still
+      # worth keeping: adding the allow-destroy label and running /apply must
+      # not require a fresh plan run.
+      - name: Store the plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.artifact }}
+          # The binary plan only. plan.json is NOT uploaded: it contains every
+          # resource attribute in the plan, including values a provider did not
+          # mark sensitive, and artifacts are downloadable by anyone who can
+          # read the repository.
+          path: ${{ inputs.working-directory }}/tfplan
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+          include-hidden-files: false
+
+      # Records what the plan was made against, so terraform-apply can refuse a
+      # plan whose PR has moved on. Terraform's own lineage/serial check catches
+      # a moved *state*; nothing in the plan file records the *commit*.
+      - name: Record plan provenance
+        env:
+          ENV_NAME: ${{ inputs.name }}
+          HEAD_SHA: ${{ needs.context.outputs.head-sha }}
+          PR_NUMBER: ${{ needs.context.outputs.pr-number }}
+          WORKDIR: ${{ inputs.working-directory }}
+          TF_VERSION: ${{ inputs.terraform-version }}
+          RUN_ID: ${{ github.run_id }}
+          DESTROY_COUNT: ${{ steps.guard.outputs.destroy-count }}
+        run: |
+          set -euo pipefail
+          # The exact Terraform version that wrote the plan, not the input,
+          # which may be "latest". A saved plan is only reliably readable by
+          # the version that produced it.
+          actual_version=$(terraform version -json | jq -r '.terraform_version')
+          jq -n \
+            --arg env "$ENV_NAME" \
+            --arg sha "$HEAD_SHA" \
+            --arg pr "$PR_NUMBER" \
+            --arg dir "$WORKDIR" \
+            --arg requested "$TF_VERSION" \
+            --arg actual "$actual_version" \
+            --arg run "$RUN_ID" \
+            --arg destroys "$DESTROY_COUNT" \
+            '{environment:$env, head_sha:$sha, pr_number:$pr, working_directory:$dir,
+              terraform_version_requested:$requested, terraform_version:$actual,
+              plan_run_id:$run, destroy_count:$destroys}' > plan-meta.json
+          cat plan-meta.json
+
+      - name: Store the plan provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.artifact }}-meta
+          path: plan-meta.json
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+      - name: Post the plan to the pull request
+        # always(), so a FAILED plan is reported too. Without it GitHub skips
+        # every remaining step once `terraform plan` exits non-zero and the PR
+        # gets no comment at all — a red check with no explanation — for a
+        # provider auth failure, a syntax error, a backend lock timeout or a
+        # missing var-file. This matches the destroy guard, which deliberately
+        # posts before failing the job for the same reason.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.context.outputs.pr-number }}
+          MARKER: ${{ steps.names.outputs.marker }}
+          ENV_NAME: ${{ inputs.name }}
+          WORKDIR: ${{ inputs.working-directory }}
+          HEAD_SHA: ${{ needs.context.outputs.head-sha }}
+          CHANGES: ${{ steps.plan.outputs.changes }}
+          # Consumed by the failure branch below. The plan step writes this
+          # before exiting 1; until now nothing read it.
+          PLAN_FAILED: ${{ steps.plan.outputs.failed }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          DESTROY_COUNT: ${{ steps.guard.outputs.destroy-count }}
+          CREATE_COUNT: ${{ steps.guard.outputs.create-count }}
+          UPDATE_COUNT: ${{ steps.guard.outputs.update-count }}
+          REPLACE_COUNT: ${{ steps.guard.outputs.replace-count }}
+          ALLOWED: ${{ steps.guard.outputs.allowed }}
+          SHOW_BODY: ${{ inputs.comment-plan-output }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The working directory may not exist if checkout itself failed, in
+          # which case there is nothing to report from and the step should not
+          # add a second failure of its own.
+          cd "${WORKDIR}" || {
+            echo "::warning::working directory '${WORKDIR}' is absent; nothing to report"
+            exit 0
+          }
+
+          short_sha="${HEAD_SHA:0:7}"
+          body_file="$(mktemp)"
+
+          # Update the existing comment for this environment rather than adding
+          # a new one on every run. Found by the hidden marker, so it survives
+          # edits and does not depend on comment ordering. Shared by the failure
+          # and success paths so a failure replaces the previous plan comment
+          # instead of leaving a stale green one above it.
+          post_comment() {
+            local file="$1" existing
+            existing=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+                         --jq "[.[] | select(.body | contains(\"${MARKER}\")) | .id] | first // empty")
+
+            if [ -n "$existing" ]; then
+              gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" \
+                -F body=@"$file" >/dev/null
+              echo "updated comment ${existing}"
+            else
+              gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+                -F body=@"$file" >/dev/null
+              echo "created a new comment"
+            fi
+          }
+
+          # Anything other than a clean plan-and-guard is reported as a failure,
+          # including the guard erroring on an unreadable plan. The counts are
+          # only trustworthy when both steps succeeded.
+          failed="false"
+          if [ "${PLAN_FAILED:-}" = "true" ] || [ "${PLAN_OUTCOME}" != "success" ] || [ "${GUARD_OUTCOME}" != "success" ]; then
+            failed="true"
+          fi
+
+          if [ "$failed" = "true" ]; then
+            {
+              echo "${MARKER}"
+              echo "### Terraform plan — \`${ENV_NAME}\` — FAILED"
+              echo ""
+              echo "> [!CAUTION]"
+              echo "> **The plan did not complete.** Nothing was stored, and there is nothing to apply."
+              echo ""
+              if [ -s plan.txt ]; then
+                echo "<details open><summary>Failure output</summary>"
+                echo ""
+                echo '```'
+                # The tail, not the head: Terraform prints the error last.
+                tail -c 20000 plan.txt
+                echo '```'
+                echo ""
+                echo "</details>"
+              else
+                echo "The plan produced no output. See the [job log](${RUN_URL}) — the run may have"
+                echo "failed before Terraform started, for example during init or AWS authentication."
+              fi
+              echo ""
+              echo "<sub>\`${WORKDIR}\` · commit \`${short_sha}\` · [run](${RUN_URL})</sub>"
+            } > "$body_file"
+
+            post_comment "$body_file"
+            exit 0
+          fi
+
+          {
+            echo "${MARKER}"
+            echo "### Terraform plan — \`${ENV_NAME}\`"
+            echo ""
+
+            if [ "${DESTROY_COUNT}" -gt 0 ] && [ "${ALLOWED}" != "true" ]; then
+              echo "> [!CAUTION]"
+              echo "> **Blocked: this plan destroys ${DESTROY_COUNT} resource(s).**"
+              echo "> Add the \`allow-destroy\` label to this PR and re-run with \`/plan ${ENV_NAME}\`,"
+              echo "> or change the plan so it destroys nothing."
+            elif [ "${DESTROY_COUNT}" -gt 0 ]; then
+              echo "> [!WARNING]"
+              echo "> **${DESTROY_COUNT} resource(s) will be destroyed.** Permitted by the \`allow-destroy\` label."
+            elif [ "${CHANGES}" = "true" ]; then
+              echo "> [!NOTE]"
+              echo "> No destroys. Apply with \`/apply ${ENV_NAME}\`."
+            else
+              echo "> [!NOTE]"
+              echo "> No changes. Infrastructure matches the configuration."
+            fi
+
+            echo ""
+            echo "| add | change | destroy | replace |"
+            echo "|----:|-------:|--------:|--------:|"
+            echo "| ${CREATE_COUNT} | ${UPDATE_COUNT} | ${DESTROY_COUNT} | ${REPLACE_COUNT} |"
+            echo ""
+
+            if [ "${DESTROY_COUNT}" -gt 0 ] && [ -s destroyed.txt ]; then
+              echo "<details><summary>Resources to be destroyed</summary>"
+              echo ""
+              echo '```'
+              cat destroyed.txt
+              if [ "${DESTROY_COUNT}" -gt 50 ]; then
+                echo "... and $(( DESTROY_COUNT - 50 )) more"
+              fi
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+
+            if [ "${SHOW_BODY}" = "true" ]; then
+              echo "<details><summary>Plan output</summary>"
+              echo ""
+              echo '```terraform'
+              # Truncate to stay inside GitHub's 65536-character comment limit,
+              # leaving room for everything else in the body.
+              head -c 50000 plan.txt
+              if [ "$(wc -c < plan.txt)" -gt 50000 ]; then
+                echo ""
+                echo "... truncated — see the full output in the job log."
+              fi
+              echo '```'
+              echo ""
+              echo "</details>"
+            else
+              echo "_Plan body omitted (\`comment-plan-output: false\`). See the [job log](${RUN_URL})._"
+            fi
+
+            echo ""
+            echo "<sub>\`${WORKDIR}\` · commit \`${short_sha}\` · [run](${RUN_URL})</sub>"
+          } > "$body_file"
+
+          post_comment "$body_file"
+
+      # Last, so the comment above is always posted first. This is what turns
+      # the destroy guard into a failing check.
+      - name: Enforce the destroy guard
+        if: steps.guard.outputs.allowed != 'true'
+        env:
+          DESTROY_COUNT: ${{ steps.guard.outputs.destroy-count }}
+          ENV_NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          echo "::error title=Destructive plan blocked::'${ENV_NAME}' would destroy ${DESTROY_COUNT} resource(s) without the 'allow-destroy' label"
+          exit 1
