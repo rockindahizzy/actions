@@ -1,3 +1,10 @@
 node_modules
 .DS_Store
 *.log
+
+# Docs are working notes by default — discovery sessions, scratch, drafts.
+# ADRs are the exception: decisions get committed, the thinking behind them
+# does not. Git cannot re-include a path under an excluded directory, so
+# docs/ is traversed rather than excluded outright.
+docs/*
+!docs/adr/
