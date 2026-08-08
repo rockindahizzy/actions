@@ -56,7 +56,7 @@ both a tag `aws-auth` and tags under `aws-auth/`.
 
 Actions publish as `v0` and stay there while their interface settles. Under
 `0.x`, a breaking change bumps the minor (`0.1.0 → 0.2.0`) and a feature bumps
-the patch.
+the patch. This needs three release-please settings, not one — see below.
 
 The moving tag is the major — `<action>/v0` — consistent with how `v1` will
 behave later. Breaking changes therefore *do* reach consumers pinned to `v0`.
@@ -76,15 +76,25 @@ Tooling is [release-please](https://github.com/googleapis/release-please):
   "include-component-in-tag": true,
   "include-v-in-tag": true,
   "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
   "packages": {
-    "aws-auth": { "release-type": "simple" }
+    "aws-auth": { "release-type": "simple", "initial-version": "0.1.0" }
   }
 }
 ```
 
 `release-type: simple` suits directories with no package manifest.
-`bump-minor-pre-major` is what makes `v0` meaningful — without it the first
-breaking change jumps straight to `1.0.0`.
+
+Three settings make `v0` behave as described above, and all three are required:
+
+- `bump-minor-pre-major` — a breaking change bumps the minor rather than the
+  major.
+- `bump-patch-for-minor-pre-major` — a feature bumps the patch. Without it,
+  `feat:` and `feat!:` produce the same bump and stop being distinguishable.
+- `initial-version` — **without it the first release is `1.0.0`, not `0.1.0`.**
+  `initialReleaseVersion()` returns `1.0.0`, and the pre-major flags do not
+  apply to a first release: they belong to the versioning strategy, which needs
+  a prior version to bump.
 
 **release-please does not move major tags.** It creates the exact version tag and
 the GitHub release, and stops. Moving `<action>/v0` is a second step, chained off

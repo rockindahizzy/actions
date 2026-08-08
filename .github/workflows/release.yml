@@ -1,0 +1,148 @@
+name: release
+
+# Two stages, because release-please does not move major tags: it creates the
+# exact version tag (aws-auth/v0.2.1) and stops. move-major-tags then points the
+# moving tag (aws-auth/v0) at the same commit.
+#
+# This workflow must never reference an action from this repository. A broken
+# action would otherwise block the release that fixes it. See docs/releasing.md.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      moves: ${{ steps.moves.outputs.moves }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Build a minimal {tag_name, sha, major} list rather than passing the whole
+      # outputs object through a job output: that object includes `body`, the full
+      # release notes for every released component, which is unbounded.
+      - name: Collect released components
+        id: moves
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASE_OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+          PATHS_RELEASED: ${{ steps.release.outputs.paths_released }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PATHS_RELEASED:-}" ]; then
+            echo "::error::releases_created was true but paths_released is empty"
+            exit 1
+          fi
+
+          # A root ("." ) package writes bare output keys instead of "<path>--<key>",
+          # and has no valid <component>/vN moving tag under ADR 0001. Reject it
+          # loudly rather than silently mis-tagging.
+          if jq -e 'index(".")' <<<"$PATHS_RELEASED" >/dev/null; then
+            echo '::error::a root "." package is not supported — see docs/releasing.md'
+            exit 1
+          fi
+
+          moves=$(jq -c --argjson out "$RELEASE_OUTPUTS" '
+            map({
+              path: .,
+              tag_name: $out[. + "--tag_name"],
+              sha:      $out[. + "--sha"],
+              major:    $out[. + "--major"]
+            })
+            | map(select(.tag_name != null and .sha != null and .major != null))
+          ' <<<"$PATHS_RELEASED")
+
+          expected=$(jq 'length' <<<"$PATHS_RELEASED")
+          actual=$(jq 'length' <<<"$moves")
+          if [ "$expected" -ne "$actual" ]; then
+            echo "::error::expected $expected released components, resolved $actual"
+            echo "paths_released: $PATHS_RELEASED"
+            exit 1
+          fi
+
+          echo "moves=$moves" >> "$GITHUB_OUTPUT"
+
+  move-major-tags:
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Move major tags
+        env:
+          MOVES: ${{ needs.release-please.outputs.moves }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MOVES:-}" ] || [ "$MOVES" = "[]" ]; then
+            echo "::error::no released components to tag"
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Process substitution, not a pipe: `while read` on the right of a pipe
+          # runs in a subshell, so a failure inside would not fail the step.
+          while read -r entry; do
+            tag=$(jq -er '.tag_name' <<<"$entry")
+            sha=$(jq -er '.sha'      <<<"$entry")
+            major=$(jq -er '.major'  <<<"$entry")
+
+            # Derive the component from the tag release-please actually created.
+            # Do NOT rebuild it from the package path: release-please builds tags
+            # from `component`, which is independently configurable and need not
+            # equal the path (src/util/tag-name.ts).
+            component="${tag%/v*}"
+            if [ "$component" = "$tag" ]; then
+              echo "::error::tag '$tag' is not <component>/vX.Y.Z"
+              exit 1
+            fi
+
+            moving="${component}/v${major}"
+
+            # Refuse to move a tag backwards. Queued release runs execute in order,
+            # but each tags an explicit historical SHA, so a late-landing earlier
+            # run could otherwise rewind the moving tag onto older code.
+            if git rev-parse -q --verify "refs/tags/${moving}" >/dev/null; then
+              current=$(git rev-list -n1 "refs/tags/${moving}")
+              if [ "$current" != "$sha" ] && git merge-base --is-ancestor "$sha" "$current"; then
+                echo "::warning::refusing to move ${moving} backward from ${current} to ${sha}"
+                continue
+              fi
+            else
+              echo "::warning::${moving} is new — any previous major tag is now frozen and will receive no further releases"
+            fi
+
+            echo "::notice::${moving} -> ${sha} (released ${tag})"
+            git tag -f -a "${moving}" -m "Release ${tag}" "${sha}"
+            git push --force origin "refs/tags/${moving}"
+
+            pushed=$(git rev-list -n1 "refs/tags/${moving}")
+            if [ "$pushed" != "$sha" ]; then
+              echo "::error::${moving} resolved to ${pushed}, expected ${sha}"
+              exit 1
+            fi
+          done < <(jq -c '.[]' <<<"$MOVES")
