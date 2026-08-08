@@ -61,7 +61,15 @@ jobs:
         # checkout, not this repository. $/ is the only correct form.
         run: |
           set -euo pipefail
-          if git ls-files '*/action.yml' '*/action.yaml' | xargs -r grep -nE '^\s*-?\s*uses:\s*\./' ; then
+
+          # Check grep's own exit status, not xargs'. Piping into `xargs -r`
+          # reports success when the file list is empty — xargs exits 0 without
+          # ever running grep — which an `if` reads as "matches found".
+          hits=$(git ls-files '*/action.yml' '*/action.yaml' \
+                 | xargs -r grep -nE '^\s*-?\s*uses:\s*\./' || true)
+
+          if [ -n "$hits" ]; then
+            echo "$hits"
             echo "::error::composite actions must reference siblings with \$/, never ./"
             exit 1
           fi

@@ -4,11 +4,15 @@ version: 2
 # nothing tracks a moving tag and nothing updates itself. Dependabot is what
 # keeps those pins from rotting.
 #
-# The "**/*" entry is the load-bearing one: the default "/" scans
+# The "**/*" entry is the load-bearing one. The default "/" scans
 # .github/workflows and the root action.yml only, so a pin inside a composite
 # action (e.g. aws-actions/configure-aws-credentials in aws-auth/action.yml)
-# would never be updated. That glob is undocumented for this ecosystem and is
-# being verified empirically — see probe/action.yml.
+# would never be updated — dependabot-core#6704 is open and unstarted.
+#
+# GitHub documents only the single "*" wildcard for this ecosystem and gives no
+# nested example, so this was verified empirically rather than assumed: a probe
+# action carrying an outdated pin at probe/action.yml was picked up and bumped
+# in PR #10. Do not remove this entry.
 #
 # No automerge. An auto-merged dependency update is a direct path into a
 # repository whose actions hold OIDC access to AWS.
